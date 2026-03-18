@@ -5,9 +5,15 @@
     const HIDDEN_CLASS = 'bosun-silence-hidden';
     const TOGGLE_ID = 'bosun-silence-toggle';
   
+    // ===== НАСТРОЙКИ КНОПКИ =====
+    const TOGGLE_TOP = '12px';     // <- тут регулируется высота кнопки от верхнего края
+    const TOGGLE_RIGHT = '16px';   // <- тут отступ справа
+    // ===========================
+  
     let showSilenced = false;
     let refreshTimer = null;
     let observerStarted = false;
+    let hiddenCount = 0;
   
     function injectStyles() {
       if (document.getElementById('bosun-silence-style')) return;
@@ -21,8 +27,8 @@
   
         #${TOGGLE_ID} {
           position: fixed;
-          right: 16px;
-          bottom: 16px;
+          top: ${TOGGLE_TOP};
+          right: ${TOGGLE_RIGHT};
           z-index: 2147483647;
           background: #1f2937;
           color: #fff;
@@ -32,10 +38,23 @@
           font: 13px/1.2 Arial, sans-serif;
           cursor: pointer;
           box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
         }
   
         #${TOGGLE_ID}:hover {
           opacity: 0.95;
+        }
+  
+        #${TOGGLE_ID} .bosun-silence-badge {
+          display: inline-block;
+          min-width: 22px;
+          padding: 2px 7px;
+          border-radius: 999px;
+          background: rgba(255, 255, 255, 0.18);
+          font-weight: bold;
+          text-align: center;
         }
       `;
       document.head.appendChild(style);
@@ -48,7 +67,6 @@
     function isSilencedPanel(panel) {
       const heading = getPanelHeading(panel);
       if (!heading) return false;
-  
       return !!heading.querySelector('.fa-volume-off');
     }
   
@@ -58,17 +76,20 @@
   
     function applyVisibility() {
       const panels = getAlertPanels();
+      let nextHiddenCount = 0;
   
       for (const panel of panels) {
         const silenced = isSilencedPanel(panel);
   
         if (silenced && !showSilenced) {
           panel.classList.add(HIDDEN_CLASS);
+          nextHiddenCount++;
         } else {
           panel.classList.remove(HIDDEN_CLASS);
         }
       }
   
+      hiddenCount = nextHiddenCount;
       updateToggleText();
     }
   
@@ -88,9 +109,16 @@
       const btn = document.getElementById(TOGGLE_ID);
       if (!btn) return;
   
-      btn.textContent = showSilenced
+      const label = showSilenced
         ? 'Скрыть silenced alerts'
         : 'Показать silenced alerts';
+  
+      const countForBadge = showSilenced ? 0 : hiddenCount;
+  
+      btn.innerHTML = `
+        <span>${label}</span>
+        <span class="bosun-silence-badge">${countForBadge}</span>
+      `;
     }
   
     function saveState() {
