@@ -6,8 +6,8 @@
     const TOGGLE_ID = 'bosun-silence-toggle';
   
     // ===== НАСТРОЙКИ КНОПКИ =====
-    const TOGGLE_TOP = '12px';     // <- тут регулируется высота кнопки от верхнего края
-    const TOGGLE_RIGHT = '16px';   // <- тут отступ справа
+    const TOGGLE_TOP = '12px';    // <- высота от верхнего края
+    const TOGGLE_RIGHT = '16px';  // <- отступ справа
     // ===========================
   
     let showSilenced = false;
@@ -41,10 +41,23 @@
           display: inline-flex;
           align-items: center;
           gap: 8px;
+          user-select: none;
+          -webkit-user-select: none;
+          pointer-events: auto;
         }
   
         #${TOGGLE_ID}:hover {
           opacity: 0.95;
+        }
+  
+        #${TOGGLE_ID}:focus {
+          outline: 2px solid rgba(255,255,255,0.35);
+          outline-offset: 2px;
+        }
+  
+        #${TOGGLE_ID} .bosun-silence-label {
+          display: inline-block;
+          pointer-events: none;
         }
   
         #${TOGGLE_ID} .bosun-silence-badge {
@@ -55,6 +68,7 @@
           background: rgba(255, 255, 255, 0.18);
           font-weight: bold;
           text-align: center;
+          pointer-events: none;
         }
       `;
       document.head.appendChild(style);
@@ -94,31 +108,13 @@
     }
   
     function scheduleApplyVisibility() {
-      if (refreshTimer) {
-        clearTimeout(refreshTimer);
-      }
+      if (refreshTimer) clearTimeout(refreshTimer);
   
       refreshTimer = setTimeout(() => {
         refreshTimer = null;
-        applyVisibility();
         ensureToggleExists();
+        applyVisibility();
       }, 120);
-    }
-  
-    function updateToggleText() {
-      const btn = document.getElementById(TOGGLE_ID);
-      if (!btn) return;
-  
-      const label = showSilenced
-        ? 'Скрыть silenced alerts'
-        : 'Показать silenced alerts';
-  
-      const countForBadge = showSilenced ? 0 : hiddenCount;
-  
-      btn.innerHTML = `
-        <span>${label}</span>
-        <span class="bosun-silence-badge">${countForBadge}</span>
-      `;
     }
   
     function saveState() {
@@ -133,17 +129,49 @@
       }
   
       chrome.storage.local.get([STORAGE_KEY], (result) => {
-        if (chrome.runtime?.lastError) {
-          callback();
-          return;
-        }
-  
-        if (typeof result[STORAGE_KEY] === 'boolean') {
+        if (!chrome.runtime?.lastError && typeof result[STORAGE_KEY] === 'boolean') {
           showSilenced = result[STORAGE_KEY];
         }
-  
         callback();
       });
+    }
+  
+    function updateToggleText() {
+        const btn = document.getElementById(TOGGLE_ID);
+        if (!btn) return;
+      
+        const labelNode = btn.querySelector('.bosun-silence-label');
+        const badgeNode = btn.querySelector('.bosun-silence-badge');
+        if (!labelNode || !badgeNode) return;
+      
+        if (showSilenced) {
+          labelNode.textContent = 'Скрыть silenced alerts';
+          badgeNode.style.display = 'none';
+          badgeNode.textContent = '';
+        } else {
+          labelNode.textContent = 'Показать silenced alerts';
+          badgeNode.style.display = 'inline-block';
+          badgeNode.textContent = String(hiddenCount);
+        }
+      }
+  
+    function swallowPointerStart(e) {
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') {
+        e.stopImmediatePropagation();
+      }
+    }
+  
+    function handleToggleClick(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') {
+        e.stopImmediatePropagation();
+      }
+  
+      showSilenced = !showSilenced;
+      saveState();
+      applyVisibility();
     }
   
     function ensureToggleExists() {
@@ -157,11 +185,22 @@
       btn.id = TOGGLE_ID;
       btn.type = 'button';
   
-      btn.addEventListener('click', () => {
-        showSilenced = !showSilenced;
-        saveState();
-        applyVisibility();
+      const label = document.createElement('span');
+      label.className = 'bosun-silence-label';
+  
+      const badge = document.createElement('span');
+      badge.className = 'bosun-silence-badge';
+  
+      btn.appendChild(label);
+      btn.appendChild(badge);
+  
+      // Гасим стартовые события, чтобы их не ловил Bosun
+      ['pointerdown', 'mousedown', 'touchstart'].forEach((evt) => {
+        btn.addEventListener(evt, swallowPointerStart, true);
       });
+  
+      // Сам переключатель — отдельным обработчиком
+      btn.addEventListener('click', handleToggleClick, true);
   
       document.body.appendChild(btn);
       updateToggleText();
@@ -171,8 +210,22 @@
       if (observerStarted || !document.body) return;
       observerStarted = true;
   
-      const observer = new MutationObserver(() => {
-        scheduleApplyVisibility();
+      const observer = new MutationObserver((mutations) => {
+        let shouldRefresh = false;
+  
+        for (const mutation of mutations) {
+          const target = mutation.target && mutation.target.nodeType === 1
+            ? mutation.target
+            : mutation.target?.parentElement;
+  
+          if (!target) continue;
+          if (target.id === TOGGLE_ID || target.closest?.(`#${TOGGLE_ID}`)) continue;
+  
+          shouldRefresh = true;
+          break;
+        }
+  
+        if (shouldRefresh) scheduleApplyVisibility();
       });
   
       observer.observe(document.body, {
