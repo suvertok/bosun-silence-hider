@@ -17,43 +17,29 @@
 
 ## Структура
 
-```text
-.
 ├── manifest.json
 └── content.js
 ````
 
 ## Установка в Chrome
 
-1. Сохраните файлы в отдельную папку или скачайте и распакуйте архив https://github.com/suvertok/bosun-silence-hider/archive/refs/tags/Bosun.zip:
+1. Скачайте и распакуйте архив https://github.com/suvertok/bosun-silence-hider/archive/refs/tags/Bosun.zip.
 
-   ```text
-   Bosun-Silence-Hider/
-   ├── manifest.json
-   └── content.js
-   ```
-
-2. Откройте в Chrome:
+   
+3. Откройте в Chrome:
 
    ```text
    chrome://extensions/
    ```
 
-3. Включите **Режим разработчика**.
+4. Включите **Режим разработчика**.
 
-4. Нажмите **Загрузить распакованное расширение**.
+5. Нажмите **Загрузить распакованное расширение**.
 
-5. Выберите папку с файлами расширения.
+6. Выберите папку с файлами расширения.
 
-6. Обновите страницу Bosun.
+7. Обновите страницу Bosun.
 
-## Обновление
-
-После изменений в `content.js` или `manifest.json`:
-
-1. Откройте `chrome://extensions/`
-2. Нажмите **Reload** у расширения
-3. Обновите вкладку Bosun
 
 ## Использование
 
@@ -75,6 +61,14 @@ const TOGGLE_RIGHT = '16px';
 
 * `TOGGLE_TOP` — отступ сверху
 * `TOGGLE_RIGHT` — отступ справа
+
+## Обновление
+
+После изменений в `content.js` или `manifest.json`:
+
+1. Откройте `chrome://extensions/`
+2. Нажмите **Reload** у расширения
+3. Обновите вкладку Bosun
 
 ## Ограничения
 
