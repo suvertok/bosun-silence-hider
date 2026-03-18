@@ -1,109 +1,176 @@
-(function() {
+(() => {
     'use strict';
   
+    const STORAGE_KEY = 'bosunShowSilenced';
     const HIDDEN_CLASS = 'bosun-silence-hidden';
-    let isShowingSilenced = false; // false = скрыты (режим по умолчанию), true = показаны
+    const TOGGLE_ID = 'bosun-silence-toggle';
   
-    // Внедряем стили один раз
+    let showSilenced = false;
+    let refreshTimer = null;
+    let observerStarted = false;
+  
     function injectStyles() {
-      if (document.getElementById('bosun-silence-styles')) return;
+      if (document.getElementById('bosun-silence-style')) return;
+  
       const style = document.createElement('style');
-      style.id = 'bosun-silence-styles';
+      style.id = 'bosun-silence-style';
       style.textContent = `
         .${HIDDEN_CLASS} {
           display: none !important;
+        }
+  
+        #${TOGGLE_ID} {
+          position: fixed;
+          right: 16px;
+          bottom: 16px;
+          z-index: 2147483647;
+          background: #1f2937;
+          color: #fff;
+          border: 0;
+          border-radius: 10px;
+          padding: 10px 14px;
+          font: 13px/1.2 Arial, sans-serif;
+          cursor: pointer;
+          box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+        }
+  
+        #${TOGGLE_ID}:hover {
+          opacity: 0.95;
         }
       `;
       document.head.appendChild(style);
     }
   
-    // Основная функция скрытия
-    function hideSilencedAlerts() {
-      // Если пользователь нажал "Показать", мы не скрываем
-      if (isShowingSilenced) return;
-  
-      const silencedIcons = document.querySelectorAll(
-        'span.fa-volume-off[title="This mute icon represents that the alert has been silenced."]'
-      );
-  
-      silencedIcons.forEach(icon => {
-        // Ищем контейнер алерта (строка таблицы или div)
-        const alertRow = icon.closest('tr, .alert-row, [ng-repeat*="alert"], .panel, .alert-item, tbody > tr');
-        
-        if (alertRow && !alertRow.classList.contains(HIDDEN_CLASS)) {
-          alertRow.classList.add(HIDDEN_CLASS);
-        }
-      });
+    function getPanelHeading(panel) {
+      return panel.querySelector('.panel-heading');
     }
   
-    // Переключатель видимости
-    function toggleSilencedAlerts() {
-      isShowingSilenced = !isShowingSilenced;
-      const btn = document.getElementById('bosun-toggle-silenced');
-      
-      // Находим все алерты, которые потенциально могут быть скрыты
-      const silencedIcons = document.querySelectorAll(
-        'span.fa-volume-off[title="This mute icon represents that the alert has been silenced."]'
-      );
+    function isSilencedPanel(panel) {
+      const heading = getPanelHeading(panel);
+      if (!heading) return false;
   
-      silencedIcons.forEach(icon => {
-        const alertRow = icon.closest('tr, .alert-row, [ng-repeat*="alert"], .panel, .alert-item, tbody > tr');
-        if (alertRow) {
-          if (isShowingSilenced) {
-            alertRow.classList.remove(HIDDEN_CLASS);
-          } else {
-            alertRow.classList.add(HIDDEN_CLASS);
-          }
+      return !!heading.querySelector('.fa-volume-off');
+    }
+  
+    function getAlertPanels() {
+      return Array.from(document.querySelectorAll('.panel'));
+    }
+  
+    function applyVisibility() {
+      const panels = getAlertPanels();
+  
+      for (const panel of panels) {
+        const silenced = isSilencedPanel(panel);
+  
+        if (silenced && !showSilenced) {
+          panel.classList.add(HIDDEN_CLASS);
+        } else {
+          panel.classList.remove(HIDDEN_CLASS);
         }
-      });
-  
-      if (btn) {
-        btn.textContent = isShowingSilenced ? '🔈 Скрыть сайленсы' : '🔇 Показать сайленсы';
       }
+  
+      updateToggleText();
     }
   
-    // Инициализация
-    injectStyles();
-    hideSilencedAlerts();
+    function scheduleApplyVisibility() {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer);
+      }
   
-    // Observer для отслеживания изменений в DOM (AngularJS обновляет данные динамически)
-    const observer = new MutationObserver(() => {
-      // Небольшая задержка, чтобы Angular отрисовал элементы перед скрытием
-      setTimeout(hideSilencedAlerts, 100);
-    });
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        applyVisibility();
+        ensureToggleExists();
+      }, 120);
+    }
   
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['class']
-    });
+    function updateToggleText() {
+      const btn = document.getElementById(TOGGLE_ID);
+      if (!btn) return;
   
-    // Добавление кнопки управления
-    function addToggleControl() {
-      if (document.getElementById('bosun-toggle-silenced')) return;
-      
-      const btn = document.createElement('button');
-      btn.id = 'bosun-toggle-silenced';
-      btn.textContent = '🔇 Показать сайленсы';
-      btn.style.cssText = `
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        z-index: 9999;
-        padding: 8px 12px;
-        background: #6c757d;
-        color: white;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 12px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-      `;
-      
-      btn.onclick = toggleSilencedAlerts;
+      btn.textContent = showSilenced
+        ? 'Скрыть silenced alerts'
+        : 'Показать silenced alerts';
+    }
+  
+    function saveState() {
+      if (!chrome?.storage?.local) return;
+      chrome.storage.local.set({ [STORAGE_KEY]: showSilenced });
+    }
+  
+    function loadState(callback) {
+      if (!chrome?.storage?.local) {
+        callback();
+        return;
+      }
+  
+      chrome.storage.local.get([STORAGE_KEY], (result) => {
+        if (chrome.runtime?.lastError) {
+          callback();
+          return;
+        }
+  
+        if (typeof result[STORAGE_KEY] === 'boolean') {
+          showSilenced = result[STORAGE_KEY];
+        }
+  
+        callback();
+      });
+    }
+  
+    function ensureToggleExists() {
+      let btn = document.getElementById(TOGGLE_ID);
+      if (btn) {
+        updateToggleText();
+        return;
+      }
+  
+      btn = document.createElement('button');
+      btn.id = TOGGLE_ID;
+      btn.type = 'button';
+  
+      btn.addEventListener('click', () => {
+        showSilenced = !showSilenced;
+        saveState();
+        applyVisibility();
+      });
+  
       document.body.appendChild(btn);
+      updateToggleText();
     }
   
-    setTimeout(addToggleControl, 1000);
+    function startObserver() {
+      if (observerStarted || !document.body) return;
+      observerStarted = true;
+  
+      const observer = new MutationObserver(() => {
+        scheduleApplyVisibility();
+      });
+  
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+    }
+  
+    function init() {
+      injectStyles();
+  
+      loadState(() => {
+        ensureToggleExists();
+        applyVisibility();
+        startObserver();
+  
+        setTimeout(() => {
+          ensureToggleExists();
+          applyVisibility();
+        }, 1000);
+      });
+    }
+  
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init, { once: true });
+    } else {
+      init();
+    }
   })();
