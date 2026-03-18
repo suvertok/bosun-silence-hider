@@ -1,0 +1,14 @@
+{
+    "manifest_version": 3,
+    "name": "Bosun Silence Hider",
+    "version": "1.0",
+    "description": "Скрывает засайленсенные алерты в Bosun Dashboard",
+    "permissions": ["storage"],
+    "content_scripts": [
+      {
+        "matches": ["*://bosun-test.edna.ru/*", "*://bosun.edna.ru/*"],
+        "js": ["content.js"],
+        "run_at": "document_idle"
+      }
+    ]
+  }
