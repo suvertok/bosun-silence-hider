@@ -9,15 +9,15 @@
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
   const OLD_NO_NOTE_MINUTES = 8;
 
-  const TOGGLE_TOP = '12px';
-  const TOGGLE_RIGHT = '16px';
+  // ===== НАСТРОЙКИ КНОПКИ =====
+  const TOGGLE_TOP = '12px';    // <- высота от верхнего края
+  const TOGGLE_RIGHT = '16px';  // <- отступ справа
+  // ===========================
 
   let showSilenced = false;
   let refreshTimer = null;
   let observerStarted = false;
   let hiddenCount = 0;
-  let warmupStarted = false;
-  let warmupFinished = false;
 
   function injectStyles() {
     if (document.getElementById('bosun-silence-style')) return;
@@ -89,12 +89,8 @@
     document.head.appendChild(style);
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
   function getPanelHeading(panel) {
-    return panel.querySelector(':scope > .panel-heading') || panel.querySelector('.panel-heading');
+    return panel.querySelector('.panel-heading');
   }
 
   function isSilencedPanel(panel) {
@@ -135,7 +131,6 @@
       applyVisibility();
       applyNeedsAckChildMarkers();
       applyNeedsAckParentMarkers();
-      maybeStartWarmup();
     }, 120);
   }
 
@@ -230,58 +225,13 @@
     return document.querySelector('[ts-ack-group="schedule.Groups.NeedAck"]');
   }
 
-  function uniquePanels(nodes) {
-    const seen = new Set();
-    const result = [];
-
-    for (const node of nodes) {
-      if (!node || seen.has(node)) continue;
-      seen.add(node);
-      result.push(node);
-    }
-
-    return result;
-  }
-
-  function getGroupPanels() {
-    const root = getNeedsAckRoot();
-    if (!root) return [];
-
-    return Array.from(root.querySelectorAll(':scope .panel-group > .panel')).filter((panel) => {
-      const heading = getPanelHeading(panel);
-      const title = heading?.querySelector('.panel-title');
-      const hasGroupCount = !!title?.querySelector('.pull-right.ng-binding');
-      const hasChildAge = !!heading?.querySelector('[ts-since="child.Ago"]');
-      return hasGroupCount && !hasChildAge;
-    });
-  }
-
-  function getExpandedGroupPanels() {
-    return getGroupPanels().filter((panel) => {
-      return !!panel.querySelector(':scope > .panel-body.panel-group, :scope > .panel-body');
-    });
-  }
-
   function getChildAlertPanels() {
     const root = getNeedsAckRoot();
     if (!root) return [];
 
-    const byHeading = Array.from(
-      root.querySelectorAll('.panel-heading[ng-click="toggle()"]')
-    )
-      .filter((heading) => {
-        return !!(
-          heading.querySelector('[ts-since="child.Ago"]') ||
-          heading.querySelector('[ng-bind="child.Subject || child.AlertKey"]')
-        );
-      })
-      .map((heading) => heading.closest('.panel'));
-
-    const byExplicitRepeat = Array.from(
-      root.querySelectorAll('[ng-repeat="child in group.Children"]')
-    ).map((node) => node.closest('.panel') || node);
-
-    return uniquePanels([...byHeading, ...byExplicitRepeat]).filter(Boolean);
+    return Array.from(root.querySelectorAll('[ng-repeat="child in group.Children"]'))
+      .map((node) => node.closest('.panel') || node)
+      .filter(Boolean);
   }
 
   function getChildHeading(panel) {
@@ -327,9 +277,6 @@
     match = normalized.match(/\((\d+)\s*d\s*ago\)/i);
     if (match) return Number(match[1]) * 86400;
 
-    match = normalized.match(/\((\d+)h(\d+)m(\d+)sago\)/i);
-    if (match) return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
-
     return null;
   }
 
@@ -358,54 +305,21 @@
     }) || null;
   }
 
-  function getPanelKey(panel) {
-    const heading = getChildHeading(panel);
-    if (!heading) return null;
-
-    const idNode = heading.querySelector('span[ng-show="state.Id"]');
-    const subjectNode = heading.querySelector('[ng-bind="child.Subject || child.AlertKey"]');
-
-    const idText = idNode?.textContent?.trim() || '';
-    const subjectText = subjectNode?.textContent?.trim() || '';
-
-    if (!idText && !subjectText) return null;
-    return `${idText}__${subjectText}`;
-  }
-
-  function getCachedNoteState(panel) {
-    const key = getPanelKey(panel);
-    if (!key) return null;
-
-    const attr = panel.dataset.bosunHasNote;
-    if (attr === '1') return true;
-    if (attr === '0') return false;
-    return null;
-  }
-
-  function setCachedNoteState(panel, hasNote) {
-    panel.dataset.bosunHasNote = hasNote ? '1' : '0';
-  }
-
   function hasLastActionNote(panel) {
     const row = getLastActionRow(panel);
-    if (!row) return getCachedNoteState(panel);
-
+    if (!row) return null; // unknown: body не раскрыт, данных о Note нет
+  
     const explicit = row.querySelector('span[ng-show="state.LastAction.Message"]:not(.ng-hide)');
     if (explicit && explicit.textContent.trim().replace(/^:\s*/, '')) {
-      setCachedNoteState(panel, true);
       return true;
     }
-
+  
     const allMessageNodes = row.querySelectorAll('span[ng-show="state.LastAction.Message"]');
     for (const node of allMessageNodes) {
       const text = node.textContent.trim().replace(/^:\s*/, '');
-      if (text) {
-        setCachedNoteState(panel, true);
-        return true;
-      }
+      if (text) return true;
     }
-
-    setCachedNoteState(panel, false);
+  
     return false;
   }
 
@@ -434,52 +348,27 @@
 
   function applyNeedsAckChildMarkers() {
     const panels = getChildAlertPanels();
-
+  
     panels.forEach((panel) => {
       const ageSeconds = getChildAgeSeconds(panel);
       const hasNote = hasLastActionNote(panel);
-
+  
       const shouldShow =
         ageSeconds != null &&
         ageSeconds > OLD_NO_NOTE_MINUTES * 60 &&
         hasNote === false;
-
+  
       ensureOldNoNoteIcon(panel, shouldShow);
     });
   }
 
-  function findOwningGroupPanel(childPanel) {
-    const root = getNeedsAckRoot();
-    if (!root || !childPanel) return null;
-
-    let current = childPanel.parentElement;
-    let candidate = null;
-
-    while (current && current !== root) {
-      if (current.classList?.contains('panel')) {
-        const hasGroupHeading =
-          current.querySelector(':scope > .panel-heading .panel-title .pull-right.ng-binding') &&
-          !current.querySelector(':scope > .panel-heading [ts-since="child.Ago"]');
-
-        if (hasGroupHeading) {
-          candidate = current;
-        }
-      }
-      current = current.parentElement;
-    }
-
-    return candidate;
-  }
-
-  function getAllGroupPanels() {
-    const childPanels = getChildAlertPanels();
-    return uniquePanels([...getGroupPanels(), ...childPanels.map(findOwningGroupPanel)]).filter(Boolean);
-  }
-
   function applyNeedsAckParentMarkers() {
-    const groupPanels = getAllGroupPanels();
+    const root = getNeedsAckRoot();
+    if (!root) return;
 
-    groupPanels.forEach((groupPanel) => {
+    const groups = Array.from(root.querySelectorAll(':scope > .panel-group > .panel, :scope > .panel'));
+
+    groups.forEach((groupPanel) => {
       const groupHeading =
         groupPanel.querySelector(':scope > .panel-heading') ||
         groupPanel.querySelector('.panel-heading');
@@ -487,14 +376,12 @@
       const groupTitle = groupHeading?.querySelector('.panel-title');
       if (!groupHeading || !groupTitle) return;
 
-      const childPanels = getChildAlertPanels().filter((childPanel) => {
-        return groupPanel.contains(childPanel) && childPanel !== groupPanel;
-      });
+      const childPanels = Array.from(groupPanel.querySelectorAll('.panel-body .panel'));
 
       const hasProblemChild = childPanels.some((childPanel) => {
         const ageSeconds = getChildAgeSeconds(childPanel);
         const hasNote = hasLastActionNote(childPanel);
-
+      
         return ageSeconds != null &&
                ageSeconds > OLD_NO_NOTE_MINUTES * 60 &&
                hasNote === false;
@@ -517,84 +404,6 @@
         groupTitle.insertBefore(icon, groupTitle.firstChild);
       }
     });
-  }
-
-  async function warmupNeedsAckPanels() {
-    if (warmupStarted || warmupFinished) return;
-    warmupStarted = true;
-
-    try {
-      const groups = getGroupPanels();
-      if (!groups.length) {
-        warmupFinished = true;
-        return;
-      }
-
-      const closedGroups = groups.filter((groupPanel) => {
-        return !groupPanel.querySelector(':scope > .panel-body.panel-group, :scope > .panel-body');
-      });
-
-      if (!closedGroups.length) {
-        warmupFinished = true;
-        applyNeedsAckChildMarkers();
-        applyNeedsAckParentMarkers();
-        return;
-      }
-
-      const scrollX = window.scrollX;
-      const scrollY = window.scrollY;
-
-      for (const groupPanel of closedGroups) {
-        const heading = getPanelHeading(groupPanel);
-        if (!heading) continue;
-
-        heading.click();
-        await sleep(120);
-
-        const childPanels = Array.from(
-          groupPanel.querySelectorAll(':scope > .panel-body .panel')
-        );
-
-        for (const childPanel of childPanels) {
-          const childHeading = getChildHeading(childPanel);
-          if (!childHeading) continue;
-
-          const cached = getCachedNoteState(childPanel);
-          if (cached !== null) continue;
-
-          childHeading.click();
-          await sleep(80);
-
-          hasLastActionNote(childPanel);
-
-          childHeading.click();
-          await sleep(30);
-        }
-
-        heading.click();
-        await sleep(50);
-      }
-
-      window.scrollTo(scrollX, scrollY);
-
-      warmupFinished = true;
-      applyNeedsAckChildMarkers();
-      applyNeedsAckParentMarkers();
-    } catch (err) {
-      console.warn('[Bosun plugin] warmup failed:', err);
-    }
-  }
-
-  function maybeStartWarmup() {
-    if (warmupStarted || warmupFinished) return;
-
-    const root = getNeedsAckRoot();
-    if (!root) return;
-
-    const groups = getGroupPanels();
-    if (!groups.length) return;
-
-    warmupNeedsAckPanels();
   }
 
   function startObserver() {
@@ -636,14 +445,12 @@
       applyNeedsAckChildMarkers();
       applyNeedsAckParentMarkers();
       startObserver();
-      maybeStartWarmup();
 
       setTimeout(() => {
         ensureToggleExists();
         applyVisibility();
         applyNeedsAckChildMarkers();
         applyNeedsAckParentMarkers();
-        maybeStartWarmup();
       }, 1000);
     });
   }
