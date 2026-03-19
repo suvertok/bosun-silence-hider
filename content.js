@@ -5,26 +5,36 @@
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const TOGGLE_ID = 'bosun-silence-toggle';
 
-  const OLD_NO_NOTE_CLASS = 'bosun-old-no-note';
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
-  const DATA_REFRESH_MS = 60000;
-  const OLD_NO_NOTE_MINUTES = 5;
+  const HAS_NOTE_ICON_CLASS = 'bosun-has-note-icon';
 
-  // ===== НАСТРОЙКИ КНОПКИ =====
+  const DATA_REFRESH_MS = 6000;
+  const DATA_REFRESH_DEBOUNCE_MS = 1200;
+
+  // Оставил в духе твоей текущей ветки
+  const OLD_NO_NOTE_MINUTES = 2;
+
   const TOGGLE_TOP = '12px';
   const TOGGLE_RIGHT = '16px';
-  // ===========================
 
   let showSilenced = false;
   let refreshTimer = null;
   let observerStarted = false;
   let hiddenCount = 0;
+
   let dataRefreshInFlight = false;
   let dataRefreshTimer = null;
+  let dataRefreshDebounceTimer = null;
 
-  const childProblemById = new Map();
-  const childProblemBySubject = new Map();
-  const groupProblemBySubject = new Map();
+  // child maps
+  const childOldNoNoteById = new Map();
+  const childOldNoNoteBySubject = new Map();
+  const childHasNoteById = new Map();
+  const childHasNoteBySubject = new Map();
+
+  // group maps
+  const groupHasOldNoNoteBySubject = new Map();
+  const groupHasAnyNoteBySubject = new Map();
 
   function injectStyles() {
     if (document.getElementById('bosun-silence-style')) return;
@@ -38,6 +48,13 @@
 
       .${OLD_NO_NOTE_ICON_CLASS} {
         color: #ff9800 !important;
+        margin-right: 6px;
+        font-size: 14px;
+        vertical-align: middle;
+      }
+
+      .${HAS_NOTE_ICON_CLASS} {
+        color: #2b8a3e !important;
         margin-right: 6px;
         font-size: 14px;
         vertical-align: middle;
@@ -93,13 +110,12 @@
   }
 
   function getPanelHeading(panel) {
-    return panel.querySelector(':scope > .panel-heading') || panel.querySelector('.panel-heading');
+    return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
   }
 
   function isSilencedPanel(panel) {
     const heading = getPanelHeading(panel);
-    if (!heading) return false;
-    return !!heading.querySelector('.fa-volume-off');
+    return !!heading?.querySelector('.fa-volume-off');
   }
 
   function getAlertPanels() {
@@ -111,9 +127,7 @@
     let nextHiddenCount = 0;
 
     for (const panel of panels) {
-      const silenced = isSilencedPanel(panel);
-
-      if (silenced && !showSilenced) {
+      if (isSilencedPanel(panel) && !showSilenced) {
         panel.classList.add(HIDDEN_CLASS);
         nextHiddenCount++;
       } else {
@@ -134,6 +148,15 @@
       applyVisibility();
       applyNeedsAckMarkersFromData();
     }, 120);
+  }
+
+  function scheduleAlertsDataRefresh() {
+    if (dataRefreshDebounceTimer) clearTimeout(dataRefreshDebounceTimer);
+
+    dataRefreshDebounceTimer = setTimeout(() => {
+      dataRefreshDebounceTimer = null;
+      refreshAlertsData();
+    }, DATA_REFRESH_DEBOUNCE_MS);
   }
 
   function saveState() {
@@ -227,7 +250,7 @@
     return document.querySelector('[ts-ack-group="schedule.Groups.NeedAck"]');
   }
 
-  function uniquePanels(nodes) {
+  function uniqueNodes(nodes) {
     const seen = new Set();
     const result = [];
 
@@ -257,9 +280,7 @@
     const root = getNeedsAckRoot();
     if (!root) return [];
 
-    const byHeading = Array.from(
-      root.querySelectorAll('.panel-heading[ng-click="toggle()"]')
-    )
+    const byHeading = Array.from(root.querySelectorAll('.panel-heading[ng-click="toggle()"]'))
       .filter((heading) => {
         return !!(
           heading.querySelector('[ts-since="child.Ago"]') ||
@@ -268,21 +289,19 @@
       })
       .map((heading) => heading.closest('.panel'));
 
-    const byExplicitRepeat = Array.from(
-      root.querySelectorAll('[ng-repeat="child in group.Children"]')
-    ).map((node) => node.closest('.panel') || node);
+    const byRepeat = Array.from(root.querySelectorAll('[ng-repeat="child in group.Children"]'))
+      .map((node) => node.closest('.panel') || node);
 
-    return uniquePanels([...byHeading, ...byExplicitRepeat]).filter(Boolean);
+    return uniqueNodes([...byHeading, ...byRepeat]).filter(Boolean);
   }
 
   function getChildHeading(panel) {
-    return panel.querySelector(':scope > .panel-heading') || panel.querySelector('.panel-heading');
+    return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
   }
 
   function getPanelIdFromHeading(heading) {
     const idNode = heading?.querySelector('span[ng-show="state.Id"]');
     if (!idNode) return null;
-
     const match = idNode.textContent.match(/#(\d+)/);
     return match ? match[1] : null;
   }
@@ -292,13 +311,14 @@
     if (subjectNode?.textContent?.trim()) return subjectNode.textContent.trim();
 
     const idNode = heading?.querySelector('span[ng-show="state.Id"]');
-    let cloneText = heading?.querySelector('.panel-title')?.textContent || heading?.textContent || '';
-    if (idNode?.textContent) cloneText = cloneText.replace(idNode.textContent, '');
+    let text = heading?.querySelector('.panel-title')?.textContent || heading?.textContent || '';
+
+    if (idNode?.textContent) text = text.replace(idNode.textContent, '');
 
     const ageNode = heading?.querySelector('[ts-since="child.Ago"], .pull-right[ts-since]');
-    if (ageNode?.textContent) cloneText = cloneText.replace(ageNode.textContent, '');
+    if (ageNode?.textContent) text = text.replace(ageNode.textContent, '');
 
-    return cloneText.replace(/\s+/g, ' ').trim() || null;
+    return text.replace(/\s+/g, ' ').trim() || null;
   }
 
   function getGroupSubjectFromPanel(groupPanel) {
@@ -331,141 +351,240 @@
   }
 
   function rebuildAlertDataIndex(payload) {
-    childProblemById.clear();
-    childProblemBySubject.clear();
-    groupProblemBySubject.clear();
+    childOldNoNoteById.clear();
+    childOldNoNoteBySubject.clear();
+    childHasNoteById.clear();
+    childHasNoteBySubject.clear();
+    groupHasOldNoNoteBySubject.clear();
+    groupHasAnyNoteBySubject.clear();
 
     const groups = payload?.Groups?.NeedAck;
     if (!Array.isArray(groups)) return;
 
     for (const group of groups) {
       const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-      let groupHasProblem = false;
+      let groupHasOldNoNote = false;
+      let groupHasAnyNote = false;
 
       const children = Array.isArray(group?.Children) ? group.Children : [];
       for (const child of children) {
         const childId = child?.State?.Id != null ? String(child.State.Id) : null;
-        const childSubject = typeof child?.Subject === 'string' && child.Subject.trim()
-          ? child.Subject.trim()
-          : (typeof child?.AlertKey === 'string' ? child.AlertKey.trim() : null);
+        const childSubject =
+          typeof child?.Subject === 'string' && child.Subject.trim()
+            ? child.Subject.trim()
+            : (typeof child?.AlertKey === 'string' ? child.AlertKey.trim() : null);
 
         const oldEnough = isOlderThanThreshold(child?.Ago);
         const hasNote = hasNoteFromActions(child?.State?.Actions);
-        const isProblem = oldEnough && !hasNote;
+        const oldNoNote = oldEnough && !hasNote;
 
-        if (childId) childProblemById.set(childId, isProblem);
-        if (childSubject) childProblemBySubject.set(childSubject, isProblem);
-        if (isProblem) groupHasProblem = true;
+        if (childId) {
+          childOldNoNoteById.set(childId, oldNoNote);
+          childHasNoteById.set(childId, hasNote);
+        }
+        if (childSubject) {
+          childOldNoNoteBySubject.set(childSubject, oldNoNote);
+          childHasNoteBySubject.set(childSubject, hasNote);
+        }
+
+        if (oldNoNote) groupHasOldNoNote = true;
+        if (hasNote) groupHasAnyNote = true;
       }
 
       if (groupSubject) {
-        groupProblemBySubject.set(groupSubject, groupHasProblem);
+        groupHasOldNoNoteBySubject.set(groupSubject, groupHasOldNoNote);
+        groupHasAnyNoteBySubject.set(groupSubject, groupHasAnyNote);
       }
     }
   }
 
-  function ensureChildProblemIcon(panel, shouldShow) {
+  function ensureStateIcon(title, type) {
+    if (!title) return;
+
+    const warnSelector = `.${OLD_NO_NOTE_ICON_CLASS}:not(.bosun-parent-marker)`;
+    const noteSelector = `.${HAS_NOTE_ICON_CLASS}:not(.bosun-parent-marker)`;
+
+    const warnIcon = title.querySelector(warnSelector);
+    const noteIcon = title.querySelector(noteSelector);
+
+    if (type === 'warning') {
+      if (noteIcon) noteIcon.remove();
+      if (!warnIcon) {
+        const icon = document.createElement('span');
+        icon.className = `fa fa-exclamation-triangle ${OLD_NO_NOTE_ICON_CLASS}`;
+        icon.title = `Older than ${OLD_NO_NOTE_MINUTES} minutes and has no Note`;
+        title.insertBefore(icon, title.firstChild);
+      }
+      return;
+    }
+
+    if (type === 'note') {
+      if (warnIcon) warnIcon.remove();
+      if (!noteIcon) {
+        const icon = document.createElement('span');
+        icon.className = `fa fa-comment ${HAS_NOTE_ICON_CLASS}`;
+        icon.title = 'Contains Note';
+        title.insertBefore(icon, title.firstChild);
+      }
+      return;
+    }
+
+    if (warnIcon) warnIcon.remove();
+    if (noteIcon) noteIcon.remove();
+  }
+
+  function ensureChildStateIcon(panel, state) {
     const heading = getChildHeading(panel);
     const title = heading?.querySelector('.panel-title');
-    if (!heading || !title) return;
+    ensureStateIcon(title, state);
+  }
 
-    let icon = title.querySelector(`.${OLD_NO_NOTE_ICON_CLASS}:not(.bosun-parent-marker)`);
+  function ensureParentStateIcon(groupPanel, state) {
+    const heading = getPanelHeading(groupPanel);
+    const title = heading?.querySelector('.panel-title');
+    if (!title) return;
 
-    if (!shouldShow) {
-      panel.classList.remove(OLD_NO_NOTE_CLASS);
-      if (icon) icon.remove();
+    const warnSelector = `.${OLD_NO_NOTE_ICON_CLASS}.bosun-parent-marker`;
+    const noteSelector = `.${HAS_NOTE_ICON_CLASS}.bosun-parent-marker`;
+
+    const warnIcon = title.querySelector(warnSelector);
+    const noteIcon = title.querySelector(noteSelector);
+
+    if (state === 'warning') {
+      if (noteIcon) noteIcon.remove();
+      if (!warnIcon) {
+        const icon = document.createElement('span');
+        icon.className = `fa fa-exclamation-triangle ${OLD_NO_NOTE_ICON_CLASS} bosun-parent-marker`;
+        icon.title = `Contains alerts older than ${OLD_NO_NOTE_MINUTES} minutes without Note`;
+        title.insertBefore(icon, title.firstChild);
+      }
       return;
     }
 
-    panel.classList.add(OLD_NO_NOTE_CLASS);
-
-    if (!icon) {
-      icon = document.createElement('span');
-      icon.className = `fa fa-exclamation-triangle ${OLD_NO_NOTE_ICON_CLASS}`;
-      icon.title = `Older than ${OLD_NO_NOTE_MINUTES} minutes and has no Note`;
-      title.insertBefore(icon, title.firstChild);
-    }
-  }
-
-  function ensureParentProblemIcon(groupPanel, shouldShow) {
-    const groupHeading = getPanelHeading(groupPanel);
-    const groupTitle = groupHeading?.querySelector('.panel-title');
-    if (!groupHeading || !groupTitle) return;
-
-    let icon = groupTitle.querySelector(`.${OLD_NO_NOTE_ICON_CLASS}.bosun-parent-marker`);
-
-    if (!shouldShow) {
-      groupPanel.classList.remove(OLD_NO_NOTE_CLASS);
-      if (icon) icon.remove();
+    if (state === 'note') {
+      if (warnIcon) warnIcon.remove();
+      if (!noteIcon) {
+        const icon = document.createElement('span');
+        icon.className = `fa fa-comment ${HAS_NOTE_ICON_CLASS} bosun-parent-marker`;
+        icon.title = 'Contains alerts with Note';
+        title.insertBefore(icon, title.firstChild);
+      }
       return;
     }
 
-    groupPanel.classList.add(OLD_NO_NOTE_CLASS);
-
-    if (!icon) {
-      icon = document.createElement('span');
-      icon.className = `fa fa-exclamation-triangle ${OLD_NO_NOTE_ICON_CLASS} bosun-parent-marker`;
-      icon.title = `Contains alerts older than ${OLD_NO_NOTE_MINUTES} minutes without Note`;
-      groupTitle.insertBefore(icon, groupTitle.firstChild);
-    }
+    if (warnIcon) warnIcon.remove();
+    if (noteIcon) noteIcon.remove();
   }
 
-  function resolveChildProblem(panel) {
+  function resolveChildState(panel) {
     const heading = getChildHeading(panel);
-    if (!heading) return false;
+    if (!heading) return 'none';
 
     const panelId = getPanelIdFromHeading(heading);
-    if (panelId && childProblemById.has(panelId)) {
-      return childProblemById.get(panelId) === true;
-    }
-
     const subject = getPanelSubjectFromHeading(heading);
-    if (subject && childProblemBySubject.has(subject)) {
-      return childProblemBySubject.get(subject) === true;
+
+    let oldNoNote = false;
+    let hasNote = false;
+
+    if (panelId) {
+      if (childOldNoNoteById.has(panelId)) oldNoNote = childOldNoNoteById.get(panelId) === true;
+      if (childHasNoteById.has(panelId)) hasNote = childHasNoteById.get(panelId) === true;
     }
 
-    return false;
+    if (!oldNoNote && !hasNote && subject) {
+      if (childOldNoNoteBySubject.has(subject)) oldNoNote = childOldNoNoteBySubject.get(subject) === true;
+      if (childHasNoteBySubject.has(subject)) hasNote = childHasNoteBySubject.get(subject) === true;
+    }
+
+    if (oldNoNote) return 'warning';
+    if (hasNote) return 'note';
+    return 'none';
   }
 
-  function resolveGroupProblem(groupPanel) {
+  function resolveGroupState(groupPanel) {
     const subject = getGroupSubjectFromPanel(groupPanel);
-    if (subject && groupProblemBySubject.has(subject)) {
-      return groupProblemBySubject.get(subject) === true;
-    }
-    return false;
+    if (!subject) return 'none';
+
+    const hasOldNoNote = groupHasOldNoNoteBySubject.get(subject) === true;
+    const hasAnyNote = groupHasAnyNoteBySubject.get(subject) === true;
+
+    if (hasOldNoNote) return 'warning';
+    if (hasAnyNote) return 'note';
+    return 'none';
   }
 
   function applyNeedsAckMarkersFromData() {
-    const groupPanels = getGroupPanels();
-    for (const groupPanel of groupPanels) {
-      ensureParentProblemIcon(groupPanel, resolveGroupProblem(groupPanel));
-    }
-
     const childPanels = getChildAlertPanels();
     for (const childPanel of childPanels) {
-      ensureChildProblemIcon(childPanel, resolveChildProblem(childPanel));
+      ensureChildStateIcon(childPanel, resolveChildState(childPanel));
+    }
+
+    const groupPanels = getGroupPanels();
+    for (const groupPanel of groupPanels) {
+      ensureParentStateIcon(groupPanel, resolveGroupState(groupPanel));
     }
   }
 
+  async function fetchAlertsDataViaFetch() {
+    const resp = await fetch('/api/alerts?filter=', {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+      cache: 'no-store'
+    });
+
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+
+    return resp.json();
+  }
+
+  function fetchAlertsDataViaXHR() {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/alerts?filter=', true);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader('Accept', 'application/json');
+
+      xhr.onload = function () {
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(`HTTP ${xhr.status}`));
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (err) {
+          reject(err);
+        }
+      };
+
+      xhr.onerror = function () {
+        reject(new Error('XMLHttpRequest network error'));
+      };
+
+      xhr.send();
+    });
+  }
+
   async function refreshAlertsData() {
+    if (dataRefreshDebounceTimer) {
+      clearTimeout(dataRefreshDebounceTimer);
+      dataRefreshDebounceTimer = null;
+    }
+
     if (dataRefreshInFlight) return;
     dataRefreshInFlight = true;
 
     try {
-      const resp = await fetch('/api/alerts?filter=', {
-        method: 'GET',
-        credentials: 'same-origin',
-        headers: {
-          'Accept': 'application/json'
-        },
-        cache: 'no-store'
-      });
-
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
+      let payload;
+      try {
+        payload = await fetchAlertsDataViaFetch();
+      } catch (_) {
+        payload = await fetchAlertsDataViaXHR();
       }
 
-      const payload = await resp.json();
       rebuildAlertDataIndex(payload);
       applyNeedsAckMarkersFromData();
     } catch (err) {
@@ -489,7 +608,9 @@
     observerStarted = true;
 
     const observer = new MutationObserver((mutations) => {
-      let shouldRefresh = false;
+      let shouldRefreshUi = false;
+      let shouldRefreshData = false;
+      const needsAckRoot = getNeedsAckRoot();
 
       for (const mutation of mutations) {
         const target = mutation.target && mutation.target.nodeType === 1
@@ -498,17 +619,30 @@
 
         if (!target) continue;
         if (target.id === TOGGLE_ID || target.closest?.(`#${TOGGLE_ID}`)) continue;
+        if (target.classList?.contains(OLD_NO_NOTE_ICON_CLASS) || target.closest?.(`.${OLD_NO_NOTE_ICON_CLASS}`)) continue;
+        if (target.classList?.contains(HAS_NOTE_ICON_CLASS) || target.closest?.(`.${HAS_NOTE_ICON_CLASS}`)) continue;
 
-        shouldRefresh = true;
-        break;
+        shouldRefreshUi = true;
+
+        if (needsAckRoot && (needsAckRoot.contains(target) || target === needsAckRoot)) {
+          shouldRefreshData = true;
+        }
       }
 
-      if (shouldRefresh) scheduleRefresh();
+      if (shouldRefreshUi) {
+        scheduleRefresh();
+      }
+
+      if (shouldRefreshData) {
+        scheduleAlertsDataRefresh();
+      }
     });
 
     observer.observe(document.body, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributes: true,
+      characterData: true
     });
   }
 
