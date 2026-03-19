@@ -5,26 +5,22 @@
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const TOGGLE_ID = 'bosun-silence-toggle';
 
+  const OLD_NO_NOTE_CLASS = 'bosun-old-no-note';
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
   const DATA_REFRESH_MS = 60000;
-  const DATA_REFRESH_DEBOUNCE_MS = 1200;
-  const FORCE_REFRESH_MIN_INTERVAL_MS = 1500;
+  const OLD_NO_NOTE_MINUTES = 5;
 
-  // Оставил как в твоей текущей версии
-  const OLD_NO_NOTE_MINUTES = 2;
-
+  // ===== НАСТРОЙКИ КНОПКИ =====
   const TOGGLE_TOP = '12px';
   const TOGGLE_RIGHT = '16px';
+  // ===========================
 
   let showSilenced = false;
   let refreshTimer = null;
   let observerStarted = false;
   let hiddenCount = 0;
-
   let dataRefreshInFlight = false;
   let dataRefreshTimer = null;
-  let dataRefreshDebounceTimer = null;
-  let lastForcedRefreshAt = 0;
 
   const childProblemById = new Map();
   const childProblemBySubject = new Map();
@@ -97,12 +93,13 @@
   }
 
   function getPanelHeading(panel) {
-    return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
+    return panel.querySelector(':scope > .panel-heading') || panel.querySelector('.panel-heading');
   }
 
   function isSilencedPanel(panel) {
     const heading = getPanelHeading(panel);
-    return !!heading?.querySelector('.fa-volume-off');
+    if (!heading) return false;
+    return !!heading.querySelector('.fa-volume-off');
   }
 
   function getAlertPanels() {
@@ -114,7 +111,9 @@
     let nextHiddenCount = 0;
 
     for (const panel of panels) {
-      if (isSilencedPanel(panel) && !showSilenced) {
+      const silenced = isSilencedPanel(panel);
+
+      if (silenced && !showSilenced) {
         panel.classList.add(HIDDEN_CLASS);
         nextHiddenCount++;
       } else {
@@ -228,7 +227,7 @@
     return document.querySelector('[ts-ack-group="schedule.Groups.NeedAck"]');
   }
 
-  function uniqueNodes(nodes) {
+  function uniquePanels(nodes) {
     const seen = new Set();
     const result = [];
 
@@ -258,7 +257,9 @@
     const root = getNeedsAckRoot();
     if (!root) return [];
 
-    const byHeading = Array.from(root.querySelectorAll('.panel-heading[ng-click="toggle()"]'))
+    const byHeading = Array.from(
+      root.querySelectorAll('.panel-heading[ng-click="toggle()"]')
+    )
       .filter((heading) => {
         return !!(
           heading.querySelector('[ts-since="child.Ago"]') ||
@@ -267,38 +268,21 @@
       })
       .map((heading) => heading.closest('.panel'));
 
-    const byRepeat = Array.from(root.querySelectorAll('[ng-repeat="child in group.Children"]'))
-      .map((node) => node.closest('.panel') || node);
+    const byExplicitRepeat = Array.from(
+      root.querySelectorAll('[ng-repeat="child in group.Children"]')
+    ).map((node) => node.closest('.panel') || node);
 
-    return uniqueNodes([...byHeading, ...byRepeat]).filter(Boolean);
-  }
-
-  function getVisibleChildPanelsForGroup(groupPanel) {
-    if (!groupPanel) return [];
-
-    return Array.from(groupPanel.querySelectorAll(':scope > .panel-body .panel')).filter((panel) => {
-      const heading = getChildHeading(panel);
-      return !!(
-        heading &&
-        (
-          heading.querySelector('[ts-since="child.Ago"]') ||
-          heading.querySelector('[ng-bind="child.Subject || child.AlertKey"]')
-        )
-      );
-    });
+    return uniquePanels([...byHeading, ...byExplicitRepeat]).filter(Boolean);
   }
 
   function getChildHeading(panel) {
-    return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
-  }
-
-  function getChildBody(panel) {
-    return panel?.querySelector(':scope > .panel-body') || panel?.querySelector('.panel-body') || null;
+    return panel.querySelector(':scope > .panel-heading') || panel.querySelector('.panel-heading');
   }
 
   function getPanelIdFromHeading(heading) {
     const idNode = heading?.querySelector('span[ng-show="state.Id"]');
     if (!idNode) return null;
+
     const match = idNode.textContent.match(/#(\d+)/);
     return match ? match[1] : null;
   }
@@ -308,14 +292,13 @@
     if (subjectNode?.textContent?.trim()) return subjectNode.textContent.trim();
 
     const idNode = heading?.querySelector('span[ng-show="state.Id"]');
-    let text = heading?.querySelector('.panel-title')?.textContent || heading?.textContent || '';
-
-    if (idNode?.textContent) text = text.replace(idNode.textContent, '');
+    let cloneText = heading?.querySelector('.panel-title')?.textContent || heading?.textContent || '';
+    if (idNode?.textContent) cloneText = cloneText.replace(idNode.textContent, '');
 
     const ageNode = heading?.querySelector('[ts-since="child.Ago"], .pull-right[ts-since]');
-    if (ageNode?.textContent) text = text.replace(ageNode.textContent, '');
+    if (ageNode?.textContent) cloneText = cloneText.replace(ageNode.textContent, '');
 
-    return text.replace(/\s+/g, ' ').trim() || null;
+    return cloneText.replace(/\s+/g, ' ').trim() || null;
   }
 
   function getGroupSubjectFromPanel(groupPanel) {
@@ -326,52 +309,6 @@
     clone.querySelectorAll('.pull-right').forEach((n) => n.remove());
     clone.querySelectorAll('.fa').forEach((n) => n.remove());
     return clone.textContent.replace(/\s+/g, ' ').trim() || null;
-  }
-
-  function getLastActionRow(panel) {
-    const body = getChildBody(panel);
-    if (!body) return null;
-
-    const rows = Array.from(body.querySelectorAll('.row'));
-    return rows.find((row) => {
-      const strong = row.querySelector('strong');
-      return strong && strong.textContent.trim() === 'Last Action:';
-    }) || null;
-  }
-
-  function hasVisibleNoteInDom(panel) {
-    const row = getLastActionRow(panel);
-    if (!row) return null;
-
-    const explicit = row.querySelector('span[ng-show="state.LastAction.Message"]:not(.ng-hide)');
-    if (explicit && explicit.textContent.trim().replace(/^:\s*/, '')) {
-      return true;
-    }
-
-    const all = row.querySelectorAll('span[ng-show="state.LastAction.Message"]');
-    for (const node of all) {
-      const text = node.textContent.trim().replace(/^:\s*/, '');
-      if (text) return true;
-    }
-
-    return false;
-  }
-
-  function scheduleAlertsDataRefresh(delay = DATA_REFRESH_DEBOUNCE_MS) {
-    if (dataRefreshDebounceTimer) clearTimeout(dataRefreshDebounceTimer);
-
-    dataRefreshDebounceTimer = setTimeout(() => {
-      dataRefreshDebounceTimer = null;
-      refreshAlertsData();
-    }, delay);
-  }
-
-  function forceAlertsDataRefreshSoon(minIntervalMs = FORCE_REFRESH_MIN_INTERVAL_MS) {
-    const now = Date.now();
-    if (now - lastForcedRefreshAt < minIntervalMs) return;
-
-    lastForcedRefreshAt = now;
-    scheduleAlertsDataRefresh(150);
   }
 
   function hasNoteFromActions(actions) {
@@ -408,10 +345,9 @@
       const children = Array.isArray(group?.Children) ? group.Children : [];
       for (const child of children) {
         const childId = child?.State?.Id != null ? String(child.State.Id) : null;
-        const childSubject =
-          typeof child?.Subject === 'string' && child.Subject.trim()
-            ? child.Subject.trim()
-            : (typeof child?.AlertKey === 'string' ? child.AlertKey.trim() : null);
+        const childSubject = typeof child?.Subject === 'string' && child.Subject.trim()
+          ? child.Subject.trim()
+          : (typeof child?.AlertKey === 'string' ? child.AlertKey.trim() : null);
 
         const oldEnough = isOlderThanThreshold(child?.Ago);
         const hasNote = hasNoteFromActions(child?.State?.Actions);
@@ -436,9 +372,12 @@
     let icon = title.querySelector(`.${OLD_NO_NOTE_ICON_CLASS}:not(.bosun-parent-marker)`);
 
     if (!shouldShow) {
+      panel.classList.remove(OLD_NO_NOTE_CLASS);
       if (icon) icon.remove();
       return;
     }
+
+    panel.classList.add(OLD_NO_NOTE_CLASS);
 
     if (!icon) {
       icon = document.createElement('span');
@@ -456,9 +395,12 @@
     let icon = groupTitle.querySelector(`.${OLD_NO_NOTE_ICON_CLASS}.bosun-parent-marker`);
 
     if (!shouldShow) {
+      groupPanel.classList.remove(OLD_NO_NOTE_CLASS);
       if (icon) icon.remove();
       return;
     }
+
+    groupPanel.classList.add(OLD_NO_NOTE_CLASS);
 
     if (!icon) {
       icon = document.createElement('span');
@@ -468,96 +410,7 @@
     }
   }
 
-  function findOwningGroupPanel(childPanel) {
-    const root = getNeedsAckRoot();
-    let current = childPanel?.parentElement || null;
-
-    while (current && current !== root) {
-      if (
-        current.classList?.contains('panel') &&
-        current.querySelector(':scope > .panel-heading .panel-title .pull-right.ng-binding') &&
-        !current.querySelector(':scope > .panel-heading [ts-since="child.Ago"]')
-      ) {
-        return current;
-      }
-      current = current.parentElement;
-    }
-
-    return null;
-  }
-
-  function syncCachesFromVisibleGroup(groupPanel) {
-    const groupSubject = getGroupSubjectFromPanel(groupPanel);
-    if (!groupSubject) return;
-
-    const visibleChildPanels = getVisibleChildPanelsForGroup(groupPanel);
-    if (visibleChildPanels.length === 0) return;
-
-    let hasAnyKnown = false;
-    let hasAnyProblem = false;
-
-    for (const childPanel of visibleChildPanels) {
-      const heading = getChildHeading(childPanel);
-      if (!heading) continue;
-
-      const panelId = getPanelIdFromHeading(heading);
-      const childSubject = getPanelSubjectFromHeading(heading);
-      const domNote = hasVisibleNoteInDom(childPanel);
-
-      if (domNote === true) {
-        hasAnyKnown = true;
-        if (panelId) childProblemById.set(panelId, false);
-        if (childSubject) childProblemBySubject.set(childSubject, false);
-        continue;
-      }
-
-      let known = false;
-      let isProblem = false;
-
-      if (panelId && childProblemById.has(panelId)) {
-        known = true;
-        isProblem = childProblemById.get(panelId) === true;
-      } else if (childSubject && childProblemBySubject.has(childSubject)) {
-        known = true;
-        isProblem = childProblemBySubject.get(childSubject) === true;
-      }
-
-      if (known) {
-        hasAnyKnown = true;
-        if (isProblem) hasAnyProblem = true;
-      }
-    }
-
-    if (hasAnyKnown && !hasAnyProblem) {
-      groupProblemBySubject.set(groupSubject, false);
-      return;
-    }
-
-    if (hasAnyProblem) {
-      groupProblemBySubject.set(groupSubject, true);
-    }
-  }
-
   function resolveChildProblem(panel) {
-    const domNote = hasVisibleNoteInDom(panel);
-
-    if (domNote === true) {
-      const heading = getChildHeading(panel);
-      const panelId = getPanelIdFromHeading(heading);
-      const subject = getPanelSubjectFromHeading(heading);
-
-      if (panelId) childProblemById.set(panelId, false);
-      if (subject) childProblemBySubject.set(subject, false);
-
-      const groupPanel = findOwningGroupPanel(panel);
-      if (groupPanel) {
-        syncCachesFromVisibleGroup(groupPanel);
-      }
-
-      forceAlertsDataRefreshSoon();
-      return false;
-    }
-
     const heading = getChildHeading(panel);
     if (!heading) return false;
 
@@ -576,125 +429,22 @@
 
   function resolveGroupProblem(groupPanel) {
     const subject = getGroupSubjectFromPanel(groupPanel);
-    const cachedGroupProblem =
-      subject && groupProblemBySubject.has(subject)
-        ? groupProblemBySubject.get(subject) === true
-        : false;
-
-    const visibleChildPanels = getVisibleChildPanelsForGroup(groupPanel);
-
-    if (visibleChildPanels.length === 0) {
-      return cachedGroupProblem;
+    if (subject && groupProblemBySubject.has(subject)) {
+      return groupProblemBySubject.get(subject) === true;
     }
-
-    let hasUnknownChildren = false;
-    let hasProblemChildren = false;
-    let hasAnyChildrenState = false;
-
-    for (const childPanel of visibleChildPanels) {
-      const domNote = hasVisibleNoteInDom(childPanel);
-
-      if (domNote === true) {
-        hasAnyChildrenState = true;
-        continue;
-      }
-
-      const heading = getChildHeading(childPanel);
-      if (!heading) {
-        hasUnknownChildren = true;
-        continue;
-      }
-
-      const panelId = getPanelIdFromHeading(heading);
-      const childSubject = getPanelSubjectFromHeading(heading);
-
-      if (panelId && childProblemById.has(panelId)) {
-        hasAnyChildrenState = true;
-        if (childProblemById.get(panelId) === true) {
-          hasProblemChildren = true;
-        }
-        continue;
-      }
-
-      if (childSubject && childProblemBySubject.has(childSubject)) {
-        hasAnyChildrenState = true;
-        if (childProblemBySubject.get(childSubject) === true) {
-          hasProblemChildren = true;
-        }
-        continue;
-      }
-
-      hasUnknownChildren = true;
-    }
-
-    if (hasProblemChildren) {
-      if (subject) groupProblemBySubject.set(subject, true);
-      return true;
-    }
-
-    if (hasAnyChildrenState && !hasUnknownChildren) {
-      if (subject) groupProblemBySubject.set(subject, false);
-      return false;
-    }
-
-    return cachedGroupProblem;
+    return false;
   }
 
   function applyNeedsAckMarkersFromData() {
-    const childPanels = getChildAlertPanels();
+    const groupPanels = getGroupPanels();
+    for (const groupPanel of groupPanels) {
+      ensureParentProblemIcon(groupPanel, resolveGroupProblem(groupPanel));
+    }
 
+    const childPanels = getChildAlertPanels();
     for (const childPanel of childPanels) {
       ensureChildProblemIcon(childPanel, resolveChildProblem(childPanel));
     }
-
-    const groupPanels = getGroupPanels();
-    for (const groupPanel of groupPanels) {
-      syncCachesFromVisibleGroup(groupPanel);
-      ensureParentProblemIcon(groupPanel, resolveGroupProblem(groupPanel));
-    }
-  }
-
-  async function fetchAlertsDataViaFetch() {
-    const resp = await fetch('/api/alerts?filter=', {
-      method: 'GET',
-      credentials: 'same-origin',
-      headers: { Accept: 'application/json' },
-      cache: 'no-store'
-    });
-
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-
-    return resp.json();
-  }
-
-  function fetchAlertsDataViaXHR() {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/alerts?filter=', true);
-      xhr.withCredentials = true;
-      xhr.setRequestHeader('Accept', 'application/json');
-
-      xhr.onload = function () {
-        if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(`HTTP ${xhr.status}`));
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch (err) {
-          reject(err);
-        }
-      };
-
-      xhr.onerror = function () {
-        reject(new Error('XMLHttpRequest network error'));
-      };
-
-      xhr.send();
-    });
   }
 
   async function refreshAlertsData() {
@@ -702,13 +452,20 @@
     dataRefreshInFlight = true;
 
     try {
-      let payload;
-      try {
-        payload = await fetchAlertsDataViaFetch();
-      } catch (_) {
-        payload = await fetchAlertsDataViaXHR();
+      const resp = await fetch('/api/alerts?filter=', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: {
+          'Accept': 'application/json'
+        },
+        cache: 'no-store'
+      });
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
       }
 
+      const payload = await resp.json();
       rebuildAlertDataIndex(payload);
       applyNeedsAckMarkersFromData();
     } catch (err) {
@@ -732,9 +489,7 @@
     observerStarted = true;
 
     const observer = new MutationObserver((mutations) => {
-      let shouldRefreshUi = false;
-      let shouldRefreshData = false;
-      const needsAckRoot = getNeedsAckRoot();
+      let shouldRefresh = false;
 
       for (const mutation of mutations) {
         const target = mutation.target && mutation.target.nodeType === 1
@@ -743,29 +498,17 @@
 
         if (!target) continue;
         if (target.id === TOGGLE_ID || target.closest?.(`#${TOGGLE_ID}`)) continue;
-        if (target.classList?.contains(OLD_NO_NOTE_ICON_CLASS) || target.closest?.(`.${OLD_NO_NOTE_ICON_CLASS}`)) continue;
 
-        shouldRefreshUi = true;
-
-        if (needsAckRoot && (needsAckRoot.contains(target) || target === needsAckRoot)) {
-          shouldRefreshData = true;
-        }
+        shouldRefresh = true;
+        break;
       }
 
-      if (shouldRefreshUi) {
-        scheduleRefresh();
-      }
-
-      if (shouldRefreshData) {
-        scheduleAlertsDataRefresh();
-      }
+      if (shouldRefresh) scheduleRefresh();
     });
 
     observer.observe(document.body, {
       childList: true,
-      subtree: true,
-      attributes: true,
-      characterData: true
+      subtree: true
     });
   }
 
