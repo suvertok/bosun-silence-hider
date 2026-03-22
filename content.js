@@ -9,10 +9,10 @@
   const HAS_NOTE_ICON_CLASS = 'bosun-has-note-icon';
 
   const DATA_REFRESH_MS = 6000;
-  const DATA_REFRESH_DEBOUNCE_MS = 1200;
+  const DATA_REFRESH_DEBOUNCE_MS = 250;
 
   // Оставил в духе твоей текущей ветки
-  const OLD_NO_NOTE_MINUTES = 2;
+  const OLD_NO_NOTE_MINUTES = 0
 
   const TOGGLE_TOP = '12px';
   const TOGGLE_RIGHT = '16px';
@@ -24,6 +24,7 @@
 
   let dataRefreshInFlight = false;
   let dataRefreshTimer = null;
+  let dataRefreshQueued = false;
   let dataRefreshDebounceTimer = null;
 
   // child maps
@@ -35,6 +36,7 @@
   // group maps
   const groupHasOldNoNoteBySubject = new Map();
   const groupHasAnyNoteBySubject = new Map();
+  const lastResolvedParentStateBySubject = new Map();
 
   function injectStyles() {
     if (document.getElementById('bosun-silence-style')) return;
@@ -54,7 +56,7 @@
       }
 
       .${HAS_NOTE_ICON_CLASS} {
-        color: #2b8a3e !important;
+        color: #9ea19d !important;
         margin-right: 6px;
         font-size: 14px;
         vertical-align: middle;
@@ -146,7 +148,10 @@
       refreshTimer = null;
       ensureToggleExists();
       applyVisibility();
-      applyNeedsAckMarkersFromData();
+
+      // Быстрый локальный repaint по текущим index maps,
+      // но без удаления значков, если DOM ещё не устаканился.
+      repaintNeedsAckMarkersFast();
     }, 120);
   }
 
@@ -267,12 +272,9 @@
     const root = getNeedsAckRoot();
     if (!root) return [];
 
-    return Array.from(root.querySelectorAll(':scope .panel-group > .panel')).filter((panel) => {
+    return Array.from(root.querySelectorAll('.panel-group > .panel')).filter((panel) => {
       const heading = getPanelHeading(panel);
-      const title = heading?.querySelector('.panel-title');
-      const hasGroupCount = !!title?.querySelector('.pull-right.ng-binding');
-      const hasChildAge = !!heading?.querySelector('[ts-since="child.Ago"]');
-      return hasGroupCount && !hasChildAge;
+      return !!heading?.querySelector('[ng-bind="group.Subject"]');
     });
   }
 
@@ -322,13 +324,8 @@
   }
 
   function getGroupSubjectFromPanel(groupPanel) {
-    const title = getPanelHeading(groupPanel)?.querySelector('.panel-title');
-    if (!title) return null;
-
-    const clone = title.cloneNode(true);
-    clone.querySelectorAll('.pull-right').forEach((n) => n.remove());
-    clone.querySelectorAll('.fa').forEach((n) => n.remove());
-    return clone.textContent.replace(/\s+/g, ' ').trim() || null;
+    const subjectNode = getPanelHeading(groupPanel)?.querySelector('[ng-bind="group.Subject"]');
+    return subjectNode?.textContent?.replace(/\s+/g, ' ').trim() || null;
   }
 
   function hasNoteFromActions(actions) {
@@ -392,8 +389,14 @@
       }
 
       if (groupSubject) {
-        groupHasOldNoNoteBySubject.set(groupSubject, groupHasOldNoNote);
-        groupHasAnyNoteBySubject.set(groupSubject, groupHasAnyNote);
+        const prevOld = groupHasOldNoNoteBySubject.get(groupSubject) === true;
+        const prevNote = groupHasAnyNoteBySubject.get(groupSubject) === true;
+
+        groupHasOldNoNoteBySubject.set(
+          groupSubject,
+          prevOld || groupHasOldNoNote
+        );
+        groupHasAnyNoteBySubject.set(groupSubject, prevNote || groupHasAnyNote);
       }
     }
   }
@@ -431,6 +434,21 @@
 
     if (warnIcon) warnIcon.remove();
     if (noteIcon) noteIcon.remove();
+  }
+
+  function getExistingParentMarkerState(groupPanel) {
+    const heading = getPanelHeading(groupPanel);
+    const title = heading?.querySelector('.panel-title');
+    if (!title) return 'none';
+
+    if (title.querySelector(`.${OLD_NO_NOTE_ICON_CLASS}.bosun-parent-marker`)) {
+      return 'warning';
+    }
+    if (title.querySelector(`.${HAS_NOTE_ICON_CLASS}.bosun-parent-marker`)) {
+      return 'note';
+    }
+
+    return 'none';
   }
 
   function ensureChildStateIcon(panel, state) {
@@ -501,28 +519,96 @@
     return 'none';
   }
 
-  function resolveGroupState(groupPanel) {
-    const subject = getGroupSubjectFromPanel(groupPanel);
-    if (!subject) return 'none';
+  function resolveGroupStateFromDom(groupPanel) {
+    if (!groupPanel) return 'none';
 
-    const hasOldNoNote = groupHasOldNoNoteBySubject.get(subject) === true;
-    const hasAnyNote = groupHasAnyNoteBySubject.get(subject) === true;
+    const childPanels = Array.from(
+      groupPanel.querySelectorAll('[ng-repeat="child in group.Children"]')
+    )
+      .map((node) => node.closest('.panel') || node)
+      .filter(Boolean);
 
-    if (hasOldNoNote) return 'warning';
-    if (hasAnyNote) return 'note';
+    let hasWarning = false;
+    let hasNote = false;
+
+    for (const childPanel of childPanels) {
+      const state = resolveChildState(childPanel);
+      if (state === 'warning') hasWarning = true;
+      else if (state === 'note') hasNote = true;
+    }
+
+    if (hasWarning) return 'warning';
+    if (hasNote) return 'note';
+
+    const domHasWarning = !!groupPanel.querySelector(`.${OLD_NO_NOTE_ICON_CLASS}:not(.bosun-parent-marker)`);
+    const domHasNote = !!groupPanel.querySelector(`.${HAS_NOTE_ICON_CLASS}:not(.bosun-parent-marker)`);
+
+    if (domHasWarning) return 'warning';
+    if (domHasNote) return 'note';
+
     return 'none';
   }
 
-  function applyNeedsAckMarkersFromData() {
+  function resolveGroupState(groupPanel) {
+    const subject = getGroupSubjectFromPanel(groupPanel);
+
+    const domState = resolveGroupStateFromDom(groupPanel);
+    if (domState !== 'none') {
+      if (subject) lastResolvedParentStateBySubject.set(subject, domState);
+      return domState;
+    }
+
+    if (subject) {
+      const hasOldNoNote = groupHasOldNoNoteBySubject.get(subject) === true;
+      const hasAnyNote = groupHasAnyNoteBySubject.get(subject) === true;
+
+      if (hasOldNoNote) {
+        lastResolvedParentStateBySubject.set(subject, 'warning');
+        return 'warning';
+      }
+      if (hasAnyNote) {
+        lastResolvedParentStateBySubject.set(subject, 'note');
+        return 'note';
+      }
+
+      const stickyState = lastResolvedParentStateBySubject.get(subject);
+      if (stickyState === 'warning' || stickyState === 'note') {
+        return stickyState;
+      }
+    }
+
+    const existingState = getExistingParentMarkerState(groupPanel);
+    if (existingState !== 'none') return existingState;
+
+    return 'none';
+  }
+
+  function applyNeedsAckMarkersFromData(options = {}) {
+    const preserveExistingOnNone = options.preserveExistingOnNone === true;
+
     const childPanels = getChildAlertPanels();
     for (const childPanel of childPanels) {
-      ensureChildStateIcon(childPanel, resolveChildState(childPanel));
+      const state = resolveChildState(childPanel);
+      if (state !== 'none') {
+        ensureChildStateIcon(childPanel, state);
+      } else if (!preserveExistingOnNone) {
+        ensureChildStateIcon(childPanel, 'none');
+      }
     }
 
     const groupPanels = getGroupPanels();
     for (const groupPanel of groupPanels) {
-      ensureParentStateIcon(groupPanel, resolveGroupState(groupPanel));
+      const state = resolveGroupState(groupPanel);
+      if (state !== 'none') {
+        ensureParentStateIcon(groupPanel, state);
+      } else if (!preserveExistingOnNone) {
+        ensureParentStateIcon(groupPanel, 'none');
+      }
     }
+  }
+
+  function repaintNeedsAckMarkersFast() {
+    applyNeedsAckMarkersFromData({ preserveExistingOnNone: true });
   }
 
   async function fetchAlertsDataViaFetch() {
@@ -569,12 +655,21 @@
   }
 
   async function refreshAlertsData() {
+    if (dataRefreshInFlight) {
+      dataRefreshQueued = true;
+      return;
+    }
+
     if (dataRefreshDebounceTimer) {
       clearTimeout(dataRefreshDebounceTimer);
       dataRefreshDebounceTimer = null;
     }
 
-    if (dataRefreshInFlight) return;
+    if (dataRefreshInFlight) {
+      dataRefreshQueued = true;
+      return;
+    }
+
     dataRefreshInFlight = true;
 
     try {
@@ -591,13 +686,19 @@
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
     } finally {
       dataRefreshInFlight = false;
+
+      if (dataRefreshQueued) {
+        dataRefreshQueued = false;
+        setTimeout(() => {
+          refreshAlertsData();
+        }, 50);
+      }
     }
   }
 
   function startDataRefreshLoop() {
     if (dataRefreshTimer) return;
 
-    refreshAlertsData();
     dataRefreshTimer = setInterval(() => {
       refreshAlertsData();
     }, DATA_REFRESH_MS);
@@ -652,14 +753,14 @@
     loadState(() => {
       ensureToggleExists();
       applyVisibility();
-      applyNeedsAckMarkersFromData();
       startObserver();
+      refreshAlertsData();
       startDataRefreshLoop();
 
       setTimeout(() => {
         ensureToggleExists();
         applyVisibility();
-        applyNeedsAckMarkersFromData();
+        refreshAlertsData();
       }, 1000);
     });
   }
