@@ -4,6 +4,7 @@
   const STORAGE_KEY = 'bosunShowSilenced';
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
+  const NO_SELECT_CLASS = 'bosun-no-select';
   const TOGGLE_ID = 'bosun-silence-toggle';
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
@@ -82,6 +83,21 @@
         opacity: 0.85;
       }
 
+      .${NO_SELECT_CLASS} {
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+      }
+
+      .${NO_SELECT_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${NO_SELECT_CLASS}::-moz-selection {
+        background: transparent;
+      }
+
       .${OLD_NO_NOTE_ICON_CLASS} {
         color: #ff9800 !important;
         margin-right: 6px;
@@ -151,6 +167,24 @@
 
   function getChildSubjectNode(childPanel) {
     return getChildHeading(childPanel)?.querySelector('[ng-bind="child.Subject || child.AlertKey"]') || null;
+  }
+
+  function markNoSelectElements() {
+    document
+      .querySelectorAll('.panel-title > a > span.pull-right.ng-binding')
+      .forEach((el) => el.classList.add(NO_SELECT_CLASS));
+
+    document
+      .querySelectorAll('.panel-title > span.pull-right[ts-since="child.Ago"]')
+      .forEach((el) => el.classList.add(NO_SELECT_CLASS));
+
+    document
+      .querySelectorAll('.panel-title > span[ng-show="state.Id"], .panel-title > span.ng-binding')
+      .forEach((el) => {
+        if (/^#\d+:$/.test((el.textContent || '').trim())) {
+          el.classList.add(NO_SELECT_CLASS);
+        }
+      });
   }
 
   function getAlertTextFromPanel(panel) {
@@ -284,6 +318,7 @@
       ensureToggleExists();
       applyVisibility();
       ensureCopyButtons();
+      markNoSelectElements();
 
       // Быстрый локальный repaint по текущим index maps,
       // но без удаления значков, если DOM ещё не устаканился.
@@ -819,6 +854,7 @@
       rebuildAlertDataIndex(payload);
       applyNeedsAckMarkersFromData();
       ensureCopyButtons();
+      markNoSelectElements();
     } catch (err) {
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
     } finally {
@@ -891,6 +927,7 @@
       ensureToggleExists();
       applyVisibility();
       ensureCopyButtons();
+      markNoSelectElements();
       startObserver();
       refreshAlertsData();
       startDataRefreshLoop();
@@ -899,6 +936,7 @@
         ensureToggleExists();
         applyVisibility();
         ensureCopyButtons();
+        markNoSelectElements();
         refreshAlertsData();
       }, 1000);
     });
