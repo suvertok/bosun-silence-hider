@@ -120,12 +120,19 @@
     return !!heading?.querySelector('.fa-volume-off');
   }
 
-  function getAlertPanels() {
-    return Array.from(document.querySelectorAll('.panel'));
+  function getAcknowledgedRoot() {
+    return document.querySelector('[ts-ack-group="schedule.Groups.Acknowledged"]');
+  }
+
+  function getAcknowledgedPanels() {
+    const root = getAcknowledgedRoot();
+    if (!root) return [];
+
+    return Array.from(root.querySelectorAll('.panel-group > .panel'));
   }
 
   function applyVisibility() {
-    const panels = getAlertPanels();
+    const panels = getAcknowledgedPanels();
     let nextHiddenCount = 0;
 
     for (const panel of panels) {
@@ -136,6 +143,12 @@
         panel.classList.remove(HIDDEN_CLASS);
       }
     }
+
+    // На всякий случай гарантируем, что в Needs Acknowledgement ничего не скрыто
+    const needsAckRoot = getNeedsAckRoot();
+    needsAckRoot?.querySelectorAll(`.${HIDDEN_CLASS}`).forEach((panel) => {
+      panel.classList.remove(HIDDEN_CLASS);
+    });
 
     hiddenCount = nextHiddenCount;
     updateToggleText();
