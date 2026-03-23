@@ -1,9 +1,10 @@
 (() => {
-
   'use strict';
 
   const STORAGE_KEY = 'bosunShowSilenced';
   const HIDDEN_CLASS = 'bosun-silence-hidden';
+  const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
+  const NO_SELECT_CLASS = 'bosun-no-select';
   const TOGGLE_ID = 'bosun-silence-toggle';
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
@@ -40,13 +41,61 @@
   const lastResolvedParentStateBySubject = new Map();
 
   function injectStyles() {
-    if (document.getElementById('bosun-silence-style')) return;
+    if (document.getElementById('bosun-silence-hider-styles')) return;
 
     const style = document.createElement('style');
-    style.id = 'bosun-silence-style';
+    style.id = 'bosun-silence-hider-styles';
     style.textContent = `
       .${HIDDEN_CLASS} {
         display: none !important;
+      }
+
+      .${COPY_BUTTON_CLASS} {
+        margin-left: 8px;
+        padding: 1px 6px;
+        border: 1px solid rgba(255,255,255,0.25);
+        border-radius: 3px;
+        background: rgba(255,255,255,0.08);
+        color: inherit;
+        font-size: 11px;
+        line-height: 1.4;
+        cursor: pointer;
+        vertical-align: middle;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+      }
+
+      .${COPY_BUTTON_CLASS}:hover {
+        background: rgba(255,255,255,0.16);
+      }
+
+      .${COPY_BUTTON_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${COPY_BUTTON_CLASS}::-moz-selection {
+        background: transparent;
+      }
+
+      .${COPY_BUTTON_CLASS}[data-copied="true"] {
+        opacity: 0.85;
+      }
+
+      .${NO_SELECT_CLASS} {
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+      }
+
+      .${NO_SELECT_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${NO_SELECT_CLASS}::-moz-selection {
+        background: transparent;
       }
 
       .${OLD_NO_NOTE_ICON_CLASS} {
@@ -112,6 +161,112 @@
     document.head.appendChild(style);
   }
 
+  function getGroupSubjectNode(groupPanel) {
+    return getPanelHeading(groupPanel)?.querySelector('[ng-bind="group.Subject"]') || null;
+  }
+
+  function getChildSubjectNode(childPanel) {
+    return getChildHeading(childPanel)?.querySelector('[ng-bind="child.Subject || child.AlertKey"]') || null;
+  }
+
+  function markNoSelectElements() {
+    document
+      .querySelectorAll('.panel-title > a > span.pull-right.ng-binding')
+      .forEach((el) => el.classList.add(NO_SELECT_CLASS));
+
+    document
+      .querySelectorAll('.panel-title > span.pull-right[ts-since="child.Ago"]')
+      .forEach((el) => el.classList.add(NO_SELECT_CLASS));
+
+    document
+      .querySelectorAll('.panel-title > span[ng-show="state.Id"], .panel-title > span.ng-binding')
+      .forEach((el) => {
+        if (/^#\d+:$/.test((el.textContent || '').trim())) {
+          el.classList.add(NO_SELECT_CLASS);
+        }
+      });
+  }
+
+  function getAlertTextFromPanel(panel) {
+    const groupNode = getGroupSubjectNode(panel);
+    if (groupNode) {
+      return groupNode.textContent?.replace(/\s+/g, ' ').trim() || '';
+    }
+
+    const childNode = getChildSubjectNode(panel);
+    if (childNode) {
+      return childNode.textContent?.replace(/\s+/g, ' ').trim() || '';
+    }
+
+    return '';
+  }
+
+  async function copyTextToClipboard(text) {
+    if (!text) return false;
+
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (err) {
+      // Fallback для окружений без navigator.clipboard
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok;
+      } catch (_) {
+        return false;
+      }
+    }
+  }
+
+  function flashCopyButtonState(button, ok) {
+    const originalText = button.textContent;
+    button.textContent = ok ? 'Copied' : 'error';
+    button.dataset.copied = ok ? 'true' : 'false';
+    setTimeout(() => {
+      button.textContent = originalText;
+      delete button.dataset.copied;
+    }, 2000);
+  }
+
+  function ensureCopyButton(panel) {
+    const subjectNode = getGroupSubjectNode(panel) || getChildSubjectNode(panel);
+    if (!subjectNode) return;
+
+    if (subjectNode.parentElement?.querySelector(`.${COPY_BUTTON_CLASS}`)) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = COPY_BUTTON_CLASS;
+    btn.textContent = 'Copy';
+    btn.title = 'Скопировать текст алерта';
+    btn.setAttribute('unselectable', 'on');
+
+    btn.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const text = getAlertTextFromPanel(panel);
+      const ok = await copyTextToClipboard(text);
+      flashCopyButtonState(btn, ok);
+    });
+
+    subjectNode.insertAdjacentElement('afterend', btn);
+  }
+
+  function ensureCopyButtons() {
+    getAcknowledgedPanels().forEach((panel) => ensureCopyButton(panel));
+    getGroupPanels().forEach((panel) => ensureCopyButton(panel));
+    getChildAlertPanels().forEach((panel) => ensureCopyButton(panel));
+  }
+
   function getPanelHeading(panel) {
     return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
   }
@@ -121,12 +276,19 @@
     return !!heading?.querySelector('.fa-volume-off');
   }
 
-  function getAlertPanels() {
-    return Array.from(document.querySelectorAll('.panel'));
+  function getAcknowledgedRoot() {
+    return document.querySelector('[ts-ack-group="schedule.Groups.Acknowledged"]');
+  }
+
+  function getAcknowledgedPanels() {
+    const root = getAcknowledgedRoot();
+    if (!root) return [];
+
+    return Array.from(root.querySelectorAll('.panel-group > .panel'));
   }
 
   function applyVisibility() {
-    const panels = getAlertPanels();
+    const panels = getAcknowledgedPanels();
     let nextHiddenCount = 0;
 
     for (const panel of panels) {
@@ -137,6 +299,12 @@
         panel.classList.remove(HIDDEN_CLASS);
       }
     }
+
+    // На всякий случай гарантируем, что в Needs Acknowledgement ничего не скрыто
+    const needsAckRoot = getNeedsAckRoot();
+    needsAckRoot?.querySelectorAll(`.${HIDDEN_CLASS}`).forEach((panel) => {
+      panel.classList.remove(HIDDEN_CLASS);
+    });
 
     hiddenCount = nextHiddenCount;
     updateToggleText();
@@ -149,6 +317,8 @@
       refreshTimer = null;
       ensureToggleExists();
       applyVisibility();
+      ensureCopyButtons();
+      markNoSelectElements();
 
       // Быстрый локальный repaint по текущим index maps,
       // но без удаления значков, если DOM ещё не устаканился.
@@ -683,6 +853,8 @@
 
       rebuildAlertDataIndex(payload);
       applyNeedsAckMarkersFromData();
+      ensureCopyButtons();
+      markNoSelectElements();
     } catch (err) {
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
     } finally {
@@ -754,6 +926,8 @@
     loadState(() => {
       ensureToggleExists();
       applyVisibility();
+      ensureCopyButtons();
+      markNoSelectElements();
       startObserver();
       refreshAlertsData();
       startDataRefreshLoop();
@@ -761,6 +935,8 @@
       setTimeout(() => {
         ensureToggleExists();
         applyVisibility();
+        ensureCopyButtons();
+        markNoSelectElements();
         refreshAlertsData();
       }, 1000);
     });
