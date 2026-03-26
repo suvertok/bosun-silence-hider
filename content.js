@@ -5,6 +5,7 @@
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
+  const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
   const TOGGLE_ID = 'bosun-silence-toggle';
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
@@ -96,6 +97,33 @@
       }
 
       .${NO_SELECT_CLASS}::-moz-selection {
+        background: transparent;
+      }
+
+      .${SILENCED_BADGE_CLASS} {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 0 6px;
+        border: 1px solid rgba(35, 95, 207, 0.55);
+        border-radius: 999px;
+        font-size: 10px;
+        line-height: 1.5;
+        vertical-align: middle;
+        color:rgb(46, 113, 201);
+        background: rgba(255, 193, 7, 0.10);
+        box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.12) inset;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+        pointer-events: none;
+      }
+
+      .${SILENCED_BADGE_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${SILENCED_BADGE_CLASS}::-moz-selection {
         background: transparent;
       }
 
@@ -277,6 +305,37 @@
     return !!heading?.querySelector('.fa-volume-off');
   }
 
+  function ensureSilencedBadge(panel) {
+    const heading = getPanelHeading(panel);
+    if (!heading) return;
+
+    const muteIcon = heading.querySelector('.fa-volume-off');
+    if (!muteIcon) return;
+
+    let badge = muteIcon.parentElement?.querySelector(`.${SILENCED_BADGE_CLASS}`);
+    if (badge) return;
+
+    badge = document.createElement('span');
+    badge.className = `${SILENCED_BADGE_CLASS} ${NO_SELECT_CLASS}`;
+    badge.textContent = 'Silenced';
+
+    muteIcon.insertAdjacentElement('afterend', badge);
+  }
+
+  function removeSilencedBadge(panel) {
+    panel?.querySelector(`.${SILENCED_BADGE_CLASS}`)?.remove();
+  }
+
+  function refreshSilencedBadges() {
+    document.querySelectorAll('.panel').forEach((panel) => {
+      if (isSilencedPanel(panel)) {
+        ensureSilencedBadge(panel);
+      } else {
+        removeSilencedBadge(panel);
+      }
+    });
+  }
+
   function getAcknowledgedRoot() {
     return document.querySelector('[ts-ack-group="schedule.Groups.Acknowledged"]');
   }
@@ -320,6 +379,7 @@
       applyVisibility();
       ensureCopyButtons();
       markNoSelectElements();
+      refreshSilencedBadges();
 
       // Быстрый локальный repaint по текущим index maps,
       // но без удаления значков, если DOM ещё не устаканился.
@@ -856,6 +916,7 @@
       applyNeedsAckMarkersFromData();
       ensureCopyButtons();
       markNoSelectElements();
+      refreshSilencedBadges();
     } catch (err) {
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
     } finally {
@@ -929,6 +990,7 @@
       applyVisibility();
       ensureCopyButtons();
       markNoSelectElements();
+      refreshSilencedBadges();
       startObserver();
       refreshAlertsData();
       startDataRefreshLoop();
@@ -938,6 +1000,7 @@
         applyVisibility();
         ensureCopyButtons();
         markNoSelectElements();
+        refreshSilencedBadges();
         refreshAlertsData();
       }, 1000);
     });
