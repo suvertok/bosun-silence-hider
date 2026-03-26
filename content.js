@@ -2,9 +2,14 @@
   'use strict';
 
   const STORAGE_KEY = 'bosunShowSilenced';
+  const TOGGLE_POSITION_KEY = 'bosunSilenceTogglePosition';
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
+  const COPY_ALL_BUTTON_CLASS = 'bosun-copy-all-alerts-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
+  const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
+
+  let bosunSelectionDragState = null;
   const TOGGLE_ID = 'bosun-silence-toggle';
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
@@ -20,9 +25,12 @@
   const TOGGLE_RIGHT = '16px';
 
   let showSilenced = false;
+  let togglePosition = null;
   let refreshTimer = null;
   let observerStarted = false;
   let hiddenCount = 0;
+  let toggleDragState = null;
+  let suppressToggleClickUntil = 0;
 
   let dataRefreshInFlight = false;
   let dataRefreshTimer = null;
@@ -53,14 +61,15 @@
       .${COPY_BUTTON_CLASS} {
         margin-left: 8px;
         padding: 1px 6px;
-        border: 1px solid rgba(255,255,255,0.25);
-        border-radius: 3px;
+        border: 1px solid rgba(194, 180, 180, 0.85);
+        border-radius: 999px;
         background: rgba(255,255,255,0.08);
         color: inherit;
         font-size: 11px;
         line-height: 1.4;
         cursor: pointer;
         vertical-align: middle;
+        box-shadow: 0 0 0 1px rgba(155, 143, 143, 0.6) inset;
         -webkit-user-select: none;
         -moz-user-select: none;
         -ms-user-select: none;
@@ -83,6 +92,42 @@
         opacity: 0.85;
       }
 
+      .${COPY_ALL_BUTTON_CLASS} {
+        margin-left: 8px;
+        margin-right: 8px;
+        padding: 1px 6px;
+        border: 1px solid rgba(194, 180, 180, 0.85);
+        border-radius: 999px;
+        background: rgba(255,255,255,0.08);
+        color: inherit;
+        font-size: 11px;
+        line-height: 1.4;
+        cursor: pointer;
+        vertical-align: middle;
+        float: right;
+        box-shadow: 0 0 0 1px rgba(155, 143, 143, 0.6) inset;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}:hover {
+        background: rgba(255,255,255,0.16);
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}::-moz-selection {
+        background: transparent;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}[data-copied="true"] {
+        opacity: 0.85;
+      }
+
       .${NO_SELECT_CLASS} {
         -webkit-user-select: none;
         -moz-user-select: none;
@@ -95,6 +140,33 @@
       }
 
       .${NO_SELECT_CLASS}::-moz-selection {
+        background: transparent;
+      }
+
+      .${SILENCED_BADGE_CLASS} {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 0 6px;
+        border: 1px solid rgba(35, 95, 207, 0.55);
+        border-radius: 999px;
+        font-size: 10px;
+        line-height: 1.5;
+        vertical-align: middle;
+        color:rgb(46, 113, 201);
+        background: rgba(255, 193, 7, 0.10);
+        box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.12) inset;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+        pointer-events: none;
+      }
+
+      .${SILENCED_BADGE_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${SILENCED_BADGE_CLASS}::-moz-selection {
         background: transparent;
       }
 
@@ -169,6 +241,51 @@
     return getChildHeading(childPanel)?.querySelector('[ng-bind="child.Subject || child.AlertKey"]') || null;
   }
 
+  function getPanelTitle(panel) {
+    return getPanelHeading(panel)?.querySelector('.panel-title') || null;
+  }
+
+  function isGroupPanel(panel) {
+    return !!getGroupSubjectNode(panel);
+  }
+
+  function getGroupCountNode(groupPanel) {
+    return getPanelTitle(groupPanel)?.querySelector('.pull-right.ng-binding') || null;
+  }
+
+  function parseGroupAlertCount(groupPanel) {
+    const countNode = getGroupCountNode(groupPanel);
+    const text = countNode?.textContent?.replace(/\s+/g, ' ').trim() || '';
+    const match = text.match(/^(\d+)\s+alerts?$/i);
+    return match ? Number(match[1]) : 0;
+  }
+
+  function getExpandedChildPanelsForGroup(groupPanel) {
+    if (!groupPanel) return [];
+
+    return Array.from(
+      groupPanel.querySelectorAll('[ng-bind="child.Subject || child.AlertKey"]')
+    );
+  }
+
+  function getChildAlertText(nodeOrPanel) {
+    const node =
+      nodeOrPanel?.getAttribute?.('ng-bind') === 'child.Subject || child.AlertKey'
+        ? nodeOrPanel
+        : getChildSubjectNode(nodeOrPanel);
+
+    return node?.textContent?.replace(/\s+/g, ' ').trim() || '';
+  }
+
+  function getAllChildAlertTextsForGroup(groupPanel) {
+    const childNodes = getExpandedChildPanelsForGroup(groupPanel);
+    if (!childNodes.length) return [];
+
+    return childNodes
+      .map((node) => getChildAlertText(node))
+      .filter(Boolean);
+  }
+
   function markNoSelectElements() {
     document
       .querySelectorAll('.panel-title > a > span.pull-right.ng-binding')
@@ -226,14 +343,14 @@
     }
   }
 
-  function flashCopyButtonState(button, ok) {
+  function flashCopyButtonState(button, ok, errorText = 'error') {
     const originalText = button.textContent;
-    button.textContent = ok ? 'Copied' : 'error';
+    button.textContent = ok ? 'copied' : errorText;
     button.dataset.copied = ok ? 'true' : 'false';
     setTimeout(() => {
       button.textContent = originalText;
       delete button.dataset.copied;
-    }, 2000);
+    }, ok ? 1200 : 2500);
   }
 
   function ensureCopyButton(panel) {
@@ -261,9 +378,55 @@
     subjectNode.insertAdjacentElement('afterend', btn);
   }
 
+  function ensureCopyAllButton(panel) {
+    if (!isGroupPanel(panel)) return;
+
+    const title = getPanelTitle(panel);
+    const countNode = getGroupCountNode(panel);
+    if (!title || !countNode) return;
+
+    const totalCount = parseGroupAlertCount(panel);
+    const shouldShow = totalCount >= 2;
+
+    const existing = title.querySelector(`.${COPY_ALL_BUTTON_CLASS}`);
+    if (!shouldShow) {
+      existing?.remove();
+      return;
+    }
+
+    if (existing) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = COPY_ALL_BUTTON_CLASS;
+    btn.textContent = 'Copy all';
+    btn.title = 'Скопировать все вложенные алерты';
+    btn.setAttribute('unselectable', 'on');
+
+    btn.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const texts = getAllChildAlertTextsForGroup(panel);
+      const payload = texts.join('\n');
+      const ok = payload ? await copyTextToClipboard(payload) : false;
+      flashCopyButtonState(btn, ok, 'Внимание! Сначала раскрой и проверь!');
+    });
+
+    countNode.insertAdjacentElement('afterend', btn);
+  }
+
   function ensureCopyButtons() {
-    getAcknowledgedPanels().forEach((panel) => ensureCopyButton(panel));
-    getGroupPanels().forEach((panel) => ensureCopyButton(panel));
+    getAcknowledgedPanels().forEach((panel) => {
+      ensureCopyButton(panel);
+      ensureCopyAllButton(panel);
+    });
+
+    getGroupPanels().forEach((panel) => {
+      ensureCopyButton(panel);
+      ensureCopyAllButton(panel);
+    });
+
     getChildAlertPanels().forEach((panel) => ensureCopyButton(panel));
   }
 
@@ -271,9 +434,107 @@
     return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
   }
 
+  function installSelectionGuard() {
+    if (window.__bosunSelectionGuardInstalled) return;
+    window.__bosunSelectionGuardInstalled = true;
+
+    document.addEventListener(
+      'mousedown',
+      (event) => {
+        const heading = event.target?.closest?.('.panel-heading');
+        if (!heading) return;
+
+        bosunSelectionDragState = {
+          x: event.clientX,
+          y: event.clientY,
+          moved: false,
+          heading,
+        };
+      },
+      true
+    );
+
+    document.addEventListener(
+      'mousemove',
+      (event) => {
+        if (!bosunSelectionDragState) return;
+
+        const dx = Math.abs(event.clientX - bosunSelectionDragState.x);
+        const dy = Math.abs(event.clientY - bosunSelectionDragState.y);
+        if (dx > 4 || dy > 4) {
+          bosunSelectionDragState.moved = true;
+        }
+      },
+      true
+    );
+
+    document.addEventListener(
+      'mouseup',
+      () => {
+        setTimeout(() => {
+          bosunSelectionDragState = null;
+        }, 0);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'click',
+      (event) => {
+        const heading = event.target?.closest?.('.panel-heading');
+        if (!heading) return;
+
+        const selectionText = window.getSelection?.()?.toString?.().trim?.() || '';
+        const wasDragSelection =
+          bosunSelectionDragState &&
+          bosunSelectionDragState.heading === heading &&
+          bosunSelectionDragState.moved &&
+          selectionText.length > 0;
+
+        if (!wasDragSelection) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+      },
+      true
+    );
+  }
+
   function isSilencedPanel(panel) {
     const heading = getPanelHeading(panel);
     return !!heading?.querySelector('.fa-volume-off');
+  }
+
+  function ensureSilencedBadge(panel) {
+    const heading = getPanelHeading(panel);
+    if (!heading) return;
+
+    const muteIcon = heading.querySelector('.fa-volume-off');
+    if (!muteIcon) return;
+
+    let badge = muteIcon.parentElement?.querySelector(`.${SILENCED_BADGE_CLASS}`);
+    if (badge) return;
+
+    badge = document.createElement('span');
+    badge.className = `${SILENCED_BADGE_CLASS} ${NO_SELECT_CLASS}`;
+    badge.textContent = 'Silenced';
+
+    muteIcon.insertAdjacentElement('afterend', badge);
+  }
+
+  function removeSilencedBadge(panel) {
+    panel?.querySelector(`.${SILENCED_BADGE_CLASS}`)?.remove();
+  }
+
+  function refreshSilencedBadges() {
+    document.querySelectorAll('.panel').forEach((panel) => {
+      if (isSilencedPanel(panel)) {
+        ensureSilencedBadge(panel);
+      } else {
+        removeSilencedBadge(panel);
+      }
+    });
   }
 
   function getAcknowledgedRoot() {
@@ -319,6 +580,7 @@
       applyVisibility();
       ensureCopyButtons();
       markNoSelectElements();
+      refreshSilencedBadges();
 
       // Быстрый локальный repaint по текущим index maps,
       // но без удаления значков, если DOM ещё не устаканился.
@@ -340,15 +602,28 @@
     chrome.storage.local.set({ [STORAGE_KEY]: showSilenced });
   }
 
+  function saveTogglePosition() {
+    if (!chrome?.storage?.local || !togglePosition) return;
+    chrome.storage.local.set({ [TOGGLE_POSITION_KEY]: togglePosition });
+  }
+
   function loadState(callback) {
     if (!chrome?.storage?.local) {
       callback();
       return;
     }
 
-    chrome.storage.local.get([STORAGE_KEY], (result) => {
+    chrome.storage.local.get([STORAGE_KEY, TOGGLE_POSITION_KEY], (result) => {
       if (!chrome.runtime?.lastError && typeof result[STORAGE_KEY] === 'boolean') {
         showSilenced = result[STORAGE_KEY];
+      }
+      const savedPos = result[TOGGLE_POSITION_KEY];
+      if (
+        savedPos &&
+        Number.isFinite(savedPos.left) &&
+        Number.isFinite(savedPos.top)
+      ) {
+        togglePosition = { left: savedPos.left, top: savedPos.top };
       }
       callback();
     });
@@ -381,6 +656,11 @@
   }
 
   function handleToggleClick(e) {
+    if (Date.now() < suppressToggleClickUntil) {
+      e.preventDefault();
+      return;
+    }
+
     e.preventDefault();
     e.stopPropagation();
     if (typeof e.stopImmediatePropagation === 'function') {
@@ -392,9 +672,76 @@
     applyVisibility();
   }
 
+  function applyTogglePosition(btn, left, top) {
+    const maxLeft = Math.max(0, window.innerWidth - btn.offsetWidth);
+    const maxTop = Math.max(0, window.innerHeight - btn.offsetHeight);
+    const clampedLeft = Math.min(Math.max(0, left), maxLeft);
+    const clampedTop = Math.min(Math.max(0, top), maxTop);
+
+    btn.style.left = `${clampedLeft}px`;
+    btn.style.top = `${clampedTop}px`;
+    btn.style.right = 'auto';
+    togglePosition = { left: clampedLeft, top: clampedTop };
+  }
+
+  function handleTogglePointerDown(e) {
+    if (e.button !== 0) return;
+
+    const btn = e.currentTarget;
+    const rect = btn.getBoundingClientRect();
+    toggleDragState = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      originLeft: rect.left,
+      originTop: rect.top,
+      moved: false
+    };
+
+    btn.setPointerCapture?.(e.pointerId);
+    swallowPointerStart(e);
+  }
+
+  function handleTogglePointerMove(e) {
+    if (!toggleDragState || toggleDragState.pointerId !== e.pointerId) return;
+
+    const btn = e.currentTarget;
+    const dx = e.clientX - toggleDragState.startX;
+    const dy = e.clientY - toggleDragState.startY;
+
+    if (!toggleDragState.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+      toggleDragState.moved = true;
+    }
+
+    if (!toggleDragState.moved) return;
+
+    applyTogglePosition(btn, toggleDragState.originLeft + dx, toggleDragState.originTop + dy);
+    e.preventDefault();
+  }
+
+  function finishToggleDrag(e) {
+    if (!toggleDragState || toggleDragState.pointerId !== e.pointerId) return;
+
+    const moved = toggleDragState.moved;
+    toggleDragState = null;
+
+    if (moved) {
+      saveTogglePosition();
+      suppressToggleClickUntil = Date.now() + 250;
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') {
+        e.stopImmediatePropagation();
+      }
+    }
+  }
+
   function ensureToggleExists() {
     let btn = document.getElementById(TOGGLE_ID);
     if (btn) {
+      if (togglePosition) {
+        applyTogglePosition(btn, togglePosition.left, togglePosition.top);
+      }
       updateToggleText();
       return;
     }
@@ -412,13 +759,20 @@
     btn.appendChild(label);
     btn.appendChild(badge);
 
-    ['pointerdown', 'mousedown', 'touchstart'].forEach((evt) => {
+    ['mousedown', 'touchstart'].forEach((evt) => {
       btn.addEventListener(evt, swallowPointerStart, true);
     });
 
+    btn.addEventListener('pointerdown', handleTogglePointerDown, true);
+    btn.addEventListener('pointermove', handleTogglePointerMove, true);
+    btn.addEventListener('pointerup', finishToggleDrag, true);
+    btn.addEventListener('pointercancel', finishToggleDrag, true);
     btn.addEventListener('click', handleToggleClick, true);
 
     document.body.appendChild(btn);
+    if (togglePosition) {
+      applyTogglePosition(btn, togglePosition.left, togglePosition.top);
+    }
     updateToggleText();
   }
 
@@ -855,6 +1209,7 @@
       applyNeedsAckMarkersFromData();
       ensureCopyButtons();
       markNoSelectElements();
+      refreshSilencedBadges();
     } catch (err) {
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
     } finally {
@@ -922,12 +1277,14 @@
 
   function init() {
     injectStyles();
+    installSelectionGuard();
 
     loadState(() => {
       ensureToggleExists();
       applyVisibility();
       ensureCopyButtons();
       markNoSelectElements();
+      refreshSilencedBadges();
       startObserver();
       refreshAlertsData();
       startDataRefreshLoop();
@@ -937,6 +1294,7 @@
         applyVisibility();
         ensureCopyButtons();
         markNoSelectElements();
+        refreshSilencedBadges();
         refreshAlertsData();
       }, 1000);
     });
