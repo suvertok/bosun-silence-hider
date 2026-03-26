@@ -5,6 +5,7 @@
   const TOGGLE_POSITION_KEY = 'bosunSilenceTogglePosition';
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
+  const COPY_ALL_BUTTON_CLASS = 'bosun-copy-all-alerts-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
   const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
   const TOGGLE_ID = 'bosun-silence-toggle';
@@ -86,6 +87,42 @@
       }
 
       .${COPY_BUTTON_CLASS}[data-copied="true"] {
+        opacity: 0.85;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS} {
+        margin-left: 8px;
+        margin-right: 8px;
+        padding: 1px 6px;
+        border: 1px solid rgba(194, 180, 180, 0.85);
+        border-radius: 999px;
+        background: rgba(255,255,255,0.08);
+        color: inherit;
+        font-size: 11px;
+        line-height: 1.4;
+        cursor: pointer;
+        vertical-align: middle;
+        float: right;
+        box-shadow: 0 0 0 1px rgba(155, 143, 143, 0.6) inset;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}:hover {
+        background: rgba(255,255,255,0.16);
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}::selection {
+        background: transparent;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}::-moz-selection {
+        background: transparent;
+      }
+
+      .${COPY_ALL_BUTTON_CLASS}[data-copied="true"] {
         opacity: 0.85;
       }
 
@@ -202,6 +239,51 @@
     return getChildHeading(childPanel)?.querySelector('[ng-bind="child.Subject || child.AlertKey"]') || null;
   }
 
+  function getPanelTitle(panel) {
+    return getPanelHeading(panel)?.querySelector('.panel-title') || null;
+  }
+
+  function isGroupPanel(panel) {
+    return !!getGroupSubjectNode(panel);
+  }
+
+  function getGroupCountNode(groupPanel) {
+    return getPanelTitle(groupPanel)?.querySelector('.pull-right.ng-binding') || null;
+  }
+
+  function parseGroupAlertCount(groupPanel) {
+    const countNode = getGroupCountNode(groupPanel);
+    const text = countNode?.textContent?.replace(/\s+/g, ' ').trim() || '';
+    const match = text.match(/^(\d+)\s+alerts?$/i);
+    return match ? Number(match[1]) : 0;
+  }
+
+  function getExpandedChildPanelsForGroup(groupPanel) {
+    if (!groupPanel) return [];
+
+    return Array.from(
+      groupPanel.querySelectorAll('[ng-bind="child.Subject || child.AlertKey"]')
+    );
+  }
+
+  function getChildAlertText(nodeOrPanel) {
+    const node =
+      nodeOrPanel?.getAttribute?.('ng-bind') === 'child.Subject || child.AlertKey'
+        ? nodeOrPanel
+        : getChildSubjectNode(nodeOrPanel);
+
+    return node?.textContent?.replace(/\s+/g, ' ').trim() || '';
+  }
+
+  function getAllChildAlertTextsForGroup(groupPanel) {
+    const childNodes = getExpandedChildPanelsForGroup(groupPanel);
+    if (!childNodes.length) return [];
+
+    return childNodes
+      .map((node) => getChildAlertText(node))
+      .filter(Boolean);
+  }
+
   function markNoSelectElements() {
     document
       .querySelectorAll('.panel-title > a > span.pull-right.ng-binding')
@@ -259,14 +341,14 @@
     }
   }
 
-  function flashCopyButtonState(button, ok) {
+  function flashCopyButtonState(button, ok, errorText = 'error') {
     const originalText = button.textContent;
-    button.textContent = ok ? 'Copied' : 'error';
+    button.textContent = ok ? 'copied' : errorText;
     button.dataset.copied = ok ? 'true' : 'false';
     setTimeout(() => {
       button.textContent = originalText;
       delete button.dataset.copied;
-    }, 2000);
+    }, ok ? 1200 : 2500);
   }
 
   function ensureCopyButton(panel) {
@@ -294,9 +376,55 @@
     subjectNode.insertAdjacentElement('afterend', btn);
   }
 
+  function ensureCopyAllButton(panel) {
+    if (!isGroupPanel(panel)) return;
+
+    const title = getPanelTitle(panel);
+    const countNode = getGroupCountNode(panel);
+    if (!title || !countNode) return;
+
+    const totalCount = parseGroupAlertCount(panel);
+    const shouldShow = totalCount >= 2;
+
+    const existing = title.querySelector(`.${COPY_ALL_BUTTON_CLASS}`);
+    if (!shouldShow) {
+      existing?.remove();
+      return;
+    }
+
+    if (existing) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = COPY_ALL_BUTTON_CLASS;
+    btn.textContent = 'Copy all';
+    btn.title = 'Скопировать все вложенные алерты';
+    btn.setAttribute('unselectable', 'on');
+
+    btn.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const texts = getAllChildAlertTextsForGroup(panel);
+      const payload = texts.join('\n');
+      const ok = payload ? await copyTextToClipboard(payload) : false;
+      flashCopyButtonState(btn, ok, 'Внимание! Сначала раскрой и проверь!');
+    });
+
+    countNode.insertAdjacentElement('afterend', btn);
+  }
+
   function ensureCopyButtons() {
-    getAcknowledgedPanels().forEach((panel) => ensureCopyButton(panel));
-    getGroupPanels().forEach((panel) => ensureCopyButton(panel));
+    getAcknowledgedPanels().forEach((panel) => {
+      ensureCopyButton(panel);
+      ensureCopyAllButton(panel);
+    });
+
+    getGroupPanels().forEach((panel) => {
+      ensureCopyButton(panel);
+      ensureCopyAllButton(panel);
+    });
+
     getChildAlertPanels().forEach((panel) => ensureCopyButton(panel));
   }
 
