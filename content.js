@@ -2,6 +2,7 @@
   'use strict';
 
   const STORAGE_KEY = 'bosunShowSilenced';
+  const TOGGLE_POSITION_KEY = 'bosunSilenceTogglePosition';
   const HIDDEN_CLASS = 'bosun-silence-hidden';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
@@ -21,9 +22,12 @@
   const TOGGLE_RIGHT = '16px';
 
   let showSilenced = false;
+  let togglePosition = null;
   let refreshTimer = null;
   let observerStarted = false;
   let hiddenCount = 0;
+  let toggleDragState = null;
+  let suppressToggleClickUntil = 0;
 
   let dataRefreshInFlight = false;
   let dataRefreshTimer = null;
@@ -55,7 +59,7 @@
         margin-left: 8px;
         padding: 1px 6px;
         border: 1px solid rgba(194, 180, 180, 0.85);
-        border-radius: 3px;
+        border-radius: 999px;
         background: rgba(255,255,255,0.08);
         color: inherit;
         font-size: 11px;
@@ -401,15 +405,28 @@
     chrome.storage.local.set({ [STORAGE_KEY]: showSilenced });
   }
 
+  function saveTogglePosition() {
+    if (!chrome?.storage?.local || !togglePosition) return;
+    chrome.storage.local.set({ [TOGGLE_POSITION_KEY]: togglePosition });
+  }
+
   function loadState(callback) {
     if (!chrome?.storage?.local) {
       callback();
       return;
     }
 
-    chrome.storage.local.get([STORAGE_KEY], (result) => {
+    chrome.storage.local.get([STORAGE_KEY, TOGGLE_POSITION_KEY], (result) => {
       if (!chrome.runtime?.lastError && typeof result[STORAGE_KEY] === 'boolean') {
         showSilenced = result[STORAGE_KEY];
+      }
+      const savedPos = result[TOGGLE_POSITION_KEY];
+      if (
+        savedPos &&
+        Number.isFinite(savedPos.left) &&
+        Number.isFinite(savedPos.top)
+      ) {
+        togglePosition = { left: savedPos.left, top: savedPos.top };
       }
       callback();
     });
@@ -442,6 +459,11 @@
   }
 
   function handleToggleClick(e) {
+    if (Date.now() < suppressToggleClickUntil) {
+      e.preventDefault();
+      return;
+    }
+
     e.preventDefault();
     e.stopPropagation();
     if (typeof e.stopImmediatePropagation === 'function') {
@@ -453,9 +475,76 @@
     applyVisibility();
   }
 
+  function applyTogglePosition(btn, left, top) {
+    const maxLeft = Math.max(0, window.innerWidth - btn.offsetWidth);
+    const maxTop = Math.max(0, window.innerHeight - btn.offsetHeight);
+    const clampedLeft = Math.min(Math.max(0, left), maxLeft);
+    const clampedTop = Math.min(Math.max(0, top), maxTop);
+
+    btn.style.left = `${clampedLeft}px`;
+    btn.style.top = `${clampedTop}px`;
+    btn.style.right = 'auto';
+    togglePosition = { left: clampedLeft, top: clampedTop };
+  }
+
+  function handleTogglePointerDown(e) {
+    if (e.button !== 0) return;
+
+    const btn = e.currentTarget;
+    const rect = btn.getBoundingClientRect();
+    toggleDragState = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      originLeft: rect.left,
+      originTop: rect.top,
+      moved: false
+    };
+
+    btn.setPointerCapture?.(e.pointerId);
+    swallowPointerStart(e);
+  }
+
+  function handleTogglePointerMove(e) {
+    if (!toggleDragState || toggleDragState.pointerId !== e.pointerId) return;
+
+    const btn = e.currentTarget;
+    const dx = e.clientX - toggleDragState.startX;
+    const dy = e.clientY - toggleDragState.startY;
+
+    if (!toggleDragState.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+      toggleDragState.moved = true;
+    }
+
+    if (!toggleDragState.moved) return;
+
+    applyTogglePosition(btn, toggleDragState.originLeft + dx, toggleDragState.originTop + dy);
+    e.preventDefault();
+  }
+
+  function finishToggleDrag(e) {
+    if (!toggleDragState || toggleDragState.pointerId !== e.pointerId) return;
+
+    const moved = toggleDragState.moved;
+    toggleDragState = null;
+
+    if (moved) {
+      saveTogglePosition();
+      suppressToggleClickUntil = Date.now() + 250;
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') {
+        e.stopImmediatePropagation();
+      }
+    }
+  }
+
   function ensureToggleExists() {
     let btn = document.getElementById(TOGGLE_ID);
     if (btn) {
+      if (togglePosition) {
+        applyTogglePosition(btn, togglePosition.left, togglePosition.top);
+      }
       updateToggleText();
       return;
     }
@@ -473,13 +562,20 @@
     btn.appendChild(label);
     btn.appendChild(badge);
 
-    ['pointerdown', 'mousedown', 'touchstart'].forEach((evt) => {
+    ['mousedown', 'touchstart'].forEach((evt) => {
       btn.addEventListener(evt, swallowPointerStart, true);
     });
 
+    btn.addEventListener('pointerdown', handleTogglePointerDown, true);
+    btn.addEventListener('pointermove', handleTogglePointerMove, true);
+    btn.addEventListener('pointerup', finishToggleDrag, true);
+    btn.addEventListener('pointercancel', finishToggleDrag, true);
     btn.addEventListener('click', handleToggleClick, true);
 
     document.body.appendChild(btn);
+    if (togglePosition) {
+      applyTogglePosition(btn, togglePosition.left, togglePosition.top);
+    }
     updateToggleText();
   }
 
