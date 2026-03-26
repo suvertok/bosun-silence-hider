@@ -8,6 +8,8 @@
   const COPY_ALL_BUTTON_CLASS = 'bosun-copy-all-alerts-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
   const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
+
+  let bosunSelectionDragState = null;
   const TOGGLE_ID = 'bosun-silence-toggle';
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
@@ -430,6 +432,73 @@
 
   function getPanelHeading(panel) {
     return panel?.querySelector(':scope > .panel-heading') || panel?.querySelector('.panel-heading') || null;
+  }
+
+  function installSelectionGuard() {
+    if (window.__bosunSelectionGuardInstalled) return;
+    window.__bosunSelectionGuardInstalled = true;
+
+    document.addEventListener(
+      'mousedown',
+      (event) => {
+        const heading = event.target?.closest?.('.panel-heading');
+        if (!heading) return;
+
+        bosunSelectionDragState = {
+          x: event.clientX,
+          y: event.clientY,
+          moved: false,
+          heading,
+        };
+      },
+      true
+    );
+
+    document.addEventListener(
+      'mousemove',
+      (event) => {
+        if (!bosunSelectionDragState) return;
+
+        const dx = Math.abs(event.clientX - bosunSelectionDragState.x);
+        const dy = Math.abs(event.clientY - bosunSelectionDragState.y);
+        if (dx > 4 || dy > 4) {
+          bosunSelectionDragState.moved = true;
+        }
+      },
+      true
+    );
+
+    document.addEventListener(
+      'mouseup',
+      () => {
+        setTimeout(() => {
+          bosunSelectionDragState = null;
+        }, 0);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'click',
+      (event) => {
+        const heading = event.target?.closest?.('.panel-heading');
+        if (!heading) return;
+
+        const selectionText = window.getSelection?.()?.toString?.().trim?.() || '';
+        const wasDragSelection =
+          bosunSelectionDragState &&
+          bosunSelectionDragState.heading === heading &&
+          bosunSelectionDragState.moved &&
+          selectionText.length > 0;
+
+        if (!wasDragSelection) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+      },
+      true
+    );
   }
 
   function isSilencedPanel(panel) {
@@ -1208,6 +1277,7 @@
 
   function init() {
     injectStyles();
+    installSelectionGuard();
 
     loadState(() => {
       ensureToggleExists();
