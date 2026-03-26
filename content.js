@@ -53,7 +53,7 @@
       .${COPY_BUTTON_CLASS} {
         margin-left: 8px;
         padding: 1px 6px;
-        border: 1px solid rgba(255,255,255,0.25);
+        border: 1px solid rgba(194, 180, 180, 0.85);
         border-radius: 3px;
         background: rgba(255,255,255,0.08);
         color: inherit;
@@ -61,6 +61,7 @@
         line-height: 1.4;
         cursor: pointer;
         vertical-align: middle;
+        box-shadow: 0 0 0 1px rgba(155, 143, 143, 0.6) inset;
         -webkit-user-select: none;
         -moz-user-select: none;
         -ms-user-select: none;
