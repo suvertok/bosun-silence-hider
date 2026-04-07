@@ -1,14 +1,33 @@
 {
     "manifest_version": 3,
     "name": "Bosun Silence Hider",
-    "version": "1.3",
+    "version": "1.4",
     "description": "Браузерный плагин для дашборда Bosun, который снижает визуальный шум и ускоряет работу дежурного с алертами",
-    "permissions": ["storage"],
+    "permissions": [
+        "storage"
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "bosun_notification_alert_chime.wav",
+                "bosun_notification_soft_chime.wav"
+            ],
+            "matches": [
+                "*://bosun.edna.ru/*",
+                "*://bosun-test.edna.ru/*"
+            ]
+        }
+    ],
     "content_scripts": [
-      {
-        "matches": ["*://bosun-test.edna.ru/*", "*://bosun.edna.ru/*"],
-        "js": ["content.js"],
-        "run_at": "document_idle"
-      }
+        {
+            "matches": [
+                "*://bosun-test.edna.ru/*",
+                "*://bosun.edna.ru/*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_end"
+        }
     ]
-  }
+}
