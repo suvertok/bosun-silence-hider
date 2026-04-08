@@ -28,6 +28,19 @@
   const NO_SELECT_CLASS = 'bosun-no-select';
   const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
 
+  /**
+   * Показывать ли в тулбаре блок «Диагностика» (чекбокс, кнопки «Открыть лог» / модалка журнала).
+   * Сейчас выключено: в обычной работе UI отладки не нужен.
+   *
+   * Как включить снова:
+   * — поставьте значение true ниже;
+   * — перезагрузите расширение в chrome://extensions (кнопка «Обновить» у пакета).
+   *
+   * Запись в chrome.storage и внутренний diagnosticsApi при этом остаются; при скрытом UI
+   * переключатель недоступен, но флаг из storage всё ещё читается при старте.
+   */
+  const DIAGNOSTICS_TOOLBAR_UI_ENABLED = false;
+
   let bosunSelectionDragState = null;
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
@@ -90,20 +103,39 @@
   const alertsDataApi = globalThis.BosunSilenceHiderAlertsData?.createAlertsData?.({
     oldNoNoteMinutes: OLD_NO_NOTE_MINUTES
   }) || null;
+  const needAckSeverityApi = globalThis.BosunSilenceHiderNeedAckSeverity?.createNeedAckSeverity?.({
+    normalizeNeedAckChildren: (raw) => {
+      if (sharedUtils?.normalizeNeedAckChildren) {
+        return sharedUtils.normalizeNeedAckChildren(raw);
+      }
+      if (raw == null) return [];
+      if (Array.isArray(raw)) return raw;
+      return [raw];
+    }
+  }) || null;
   const needAckBaselineApi = globalThis.BosunSilenceHiderNeedAckBaseline?.createNeedAckBaseline?.({
     sessionKey: NEED_ACK_SOUND_BASELINE_SESSION_KEY,
     isSoundEnabled: () => soundAlertsEnabled,
     reportDiagnostics: (eventName, details = '') => reportDiagnostics(eventName, details),
-    playNeedAckChime: (kind) => playNeedAckChime(kind),
-    collectCurrentIdsAndSeverity: (payload) => (
-      needAckSeverityApi
-        ? needAckSeverityApi.collectCurrentIdsAndSeverity(payload)
-        : { currentIds: new Set(), idToSeverity: new Map() }
-    )
+    playNeedAckChime: (kind) => soundApi?.playNeedAckChime?.(kind),
+    collectCurrentIdsAndSeverity: (payload) =>
+      needAckSeverityApi?.collectCurrentIdsAndSeverity?.(payload) ?? {
+        currentIds: new Set(),
+        idToSeverity: new Map()
+      }
   }) || null;
-  const needAckSeverityApi = globalThis.BosunSilenceHiderNeedAckSeverity?.createNeedAckSeverity?.({
-    normalizeNeedAckChildren: (raw) => normalizeNeedAckChildren(raw)
-  }) || null;
+
+  if (!soundApi || !needAckBaselineApi || !needAckSeverityApi || !alertsDataApi) {
+    console.warn(
+      '[Bosun plugin] One or more extension modules failed to load; sound, NeedAck baseline, severity, or alerts index may be disabled.',
+      {
+        soundApi: Boolean(soundApi),
+        needAckBaselineApi: Boolean(needAckBaselineApi),
+        needAckSeverityApi: Boolean(needAckSeverityApi),
+        alertsDataApi: Boolean(alertsDataApi)
+      }
+    );
+  }
 
   function isActionPage() {
     return window.location.pathname === '/action';
@@ -398,6 +430,12 @@
         display: inline-flex;
         align-items: center;
         gap: 8px;
+        margin-left: 4px;
+        margin-right: 8px;
+        padding-left: 12px;
+        padding-right: 12px;
+        border-left: 1px solid rgba(0, 0, 0, 0.12);
+        border-right: 1px solid rgba(0, 0, 0, 0.18);
       }
 
       #${TOP_BAR_ID} .bosun-auto-refresh-label {
@@ -1031,15 +1069,6 @@
     );
   }
 
-  function normalizeNeedAckChildren(raw) {
-    if (sharedUtils?.normalizeNeedAckChildren) {
-      return sharedUtils.normalizeNeedAckChildren(raw);
-    }
-    if (raw == null) return [];
-    if (Array.isArray(raw)) return raw;
-    return [raw];
-  }
-
   function uniqueNodes(nodes) {
     if (sharedUtils?.uniqueNodes) {
       return sharedUtils.uniqueNodes(nodes);
@@ -1108,22 +1137,6 @@
   /** Стабильный ключ: Id -> AlertKey+Tags -> group+child+ago -> fallback */
   function needAckStableKey(child, group) {
     return needAckSeverityApi?.needAckStableKey?.(child, group) ?? null;
-  }
-
-  function ensureAudioObjects() {
-    soundApi?.ensureAudioObjects?.();
-  }
-
-  function installAudioUnlockTracking() {
-    soundApi?.installAudioUnlockTracking?.();
-  }
-
-  function playNeedAckChime(kind) {
-    soundApi?.playNeedAckChime?.(kind);
-  }
-
-  function processNeedAckNewAlertSounds(payload) {
-    needAckBaselineApi?.process?.(payload);
   }
 
   function loadState(callback) {
@@ -1317,7 +1330,7 @@
     e.stopPropagation();
     markUserActivity();
     reportDiagnostics('sound-test-click', `enabled=${soundAlertsEnabled ? 'on' : 'off'}`);
-    playNeedAckChime('alert');
+    soundApi?.playNeedAckChime?.('alert');
   }
 
   function handleDiagnosticsToggle(e) {
@@ -1356,7 +1369,37 @@
     updateSoundAlertsControl();
   }
 
+  /** Кнопка «Тест звука» при выключенном блоке диагностики — сразу после «Звуковое оповещение». */
+  function ensureSoundTestButtonAfterSoundWrap(actions) {
+    let testBtn = document.getElementById(SOUND_TEST_BUTTON_ID);
+    if (!testBtn) {
+      testBtn = document.createElement('button');
+      testBtn.type = 'button';
+      testBtn.id = SOUND_TEST_BUTTON_ID;
+      testBtn.textContent = 'Тест';
+      testBtn.title = 'Проиграть тестовый alert sound';
+      testBtn.addEventListener('click', handleSoundTestClick);
+    }
+    const soundWrap = actions.querySelector('.bosun-sound-alerts-wrap');
+    if (soundWrap) {
+      if (soundWrap.nextElementSibling !== testBtn) {
+        soundWrap.insertAdjacentElement('afterend', testBtn);
+      }
+    } else if (testBtn.parentElement !== actions) {
+      actions.appendChild(testBtn);
+    }
+  }
+
   function ensureDiagnosticsControls(actions) {
+    if (!DIAGNOSTICS_TOOLBAR_UI_ENABLED) {
+      const deadGroup = actions.querySelector('.bosun-diagnostics-group');
+      if (deadGroup) deadGroup.remove();
+      const deadModal = document.getElementById(DIAGNOSTICS_MODAL_ID);
+      if (deadModal) deadModal.remove();
+      ensureSoundTestButtonAfterSoundWrap(actions);
+      return;
+    }
+
     let group = actions.querySelector('.bosun-diagnostics-group');
     if (!group) {
       group = document.createElement('div');
@@ -1999,20 +2042,6 @@
     applyNeedsAckMarkersFromData({ preserveExistingOnNone: true });
   }
 
-  async function fetchAlertsDataViaFetch() {
-    if (!alertsDataApi?.fetchAlertsDataViaFetch) {
-      throw new Error('alerts-data module unavailable');
-    }
-    return alertsDataApi.fetchAlertsDataViaFetch();
-  }
-
-  function fetchAlertsDataViaXHR() {
-    if (!alertsDataApi?.fetchAlertsDataViaXHR) {
-      return Promise.reject(new Error('alerts-data module unavailable'));
-    }
-    return alertsDataApi.fetchAlertsDataViaXHR();
-  }
-
   async function refreshAlertsData() {
     if (dataRefreshInFlight) {
       dataRefreshQueued = true;
@@ -2033,14 +2062,17 @@
 
     try {
       let payload;
+      if (!alertsDataApi?.fetchAlertsDataViaFetch || !alertsDataApi?.fetchAlertsDataViaXHR) {
+        throw new Error('alerts-data module unavailable');
+      }
       try {
-        payload = await fetchAlertsDataViaFetch();
+        payload = await alertsDataApi.fetchAlertsDataViaFetch();
       } catch (_) {
-        payload = await fetchAlertsDataViaXHR();
+        payload = await alertsDataApi.fetchAlertsDataViaXHR();
       }
 
       rebuildAlertDataIndex(payload);
-      processNeedAckNewAlertSounds(payload);
+      needAckBaselineApi?.process?.(payload);
       applyNeedsAckMarkersFromData();
       ensureCopyButtons();
       markNoSelectElements();
@@ -2143,8 +2175,8 @@
     injectStyles();
     installSelectionGuard();
     installUserActivityTracking();
-    installAudioUnlockTracking();
-    ensureAudioObjects();
+    soundApi?.installAudioUnlockTracking?.();
+    soundApi?.ensureAudioObjects?.();
     scheduleTopBarMount();
     restoreNeedAckSoundBaselineFromSession();
 
