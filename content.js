@@ -2,40 +2,55 @@
   'use strict';
 
   const STORAGE_KEY = 'bosunShowSilenced';
-  const TOGGLE_POSITION_KEY = 'bosunSilenceTogglePosition';
+  const AUTO_REFRESH_ENABLED_KEY = 'bosunAutoRefreshEnabled';
+  const AUTO_REFRESH_IDLE_SECONDS_KEY = 'bosunAutoRefreshIdleSeconds';
   const HIDDEN_CLASS = 'bosun-silence-hidden';
+  const TOP_BAR_ID = 'bosun-top-controls-bar';
+  const TOGGLE_ID = 'bosun-silence-toggle';
+  const TOGGLE_COUNTER_ID = 'bosun-silence-toggle-counter';
+  const AUTO_REFRESH_TOGGLE_ID = 'bosun-auto-refresh-toggle';
+  const AUTO_REFRESH_INPUT_ID = 'bosun-auto-refresh-idle-seconds';
+  const AUTO_REFRESH_COUNTDOWN_ID = 'bosun-auto-refresh-countdown';
+  const SOUND_ALERTS_ENABLED_KEY = 'bosunSoundAlertsEnabled';
+  const SOUND_ALERTS_TOGGLE_ID = 'bosun-sound-alerts-toggle';
+  const SOUND_FILE_ALERT = 'bosun_notification_alert_chime.wav';
+  const SOUND_FILE_SOFT = 'bosun_notification_soft_chime.wav';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
   const COPY_ALL_BUTTON_CLASS = 'bosun-copy-all-alerts-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
   const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
 
   let bosunSelectionDragState = null;
-  const TOGGLE_ID = 'bosun-silence-toggle';
 
   const OLD_NO_NOTE_ICON_CLASS = 'bosun-old-no-note-icon';
   const HAS_NOTE_ICON_CLASS = 'bosun-has-note-icon';
 
   const DATA_REFRESH_MS = 6000;
   const DATA_REFRESH_DEBOUNCE_MS = 250;
-
-  // Оставил в духе твоей текущей ветки
   const OLD_NO_NOTE_MINUTES = 0
-
-  const TOGGLE_TOP = '12px';
-  const TOGGLE_RIGHT = '16px';
+  const AUTO_REFRESH_DEFAULT_IDLE_SECONDS = 60;
+  const AUTO_REFRESH_MIN_IDLE_SECONDS = 10;
+  const AUTO_REFRESH_MAX_IDLE_SECONDS = 3600;
 
   let showSilenced = false;
-  let togglePosition = null;
   let refreshTimer = null;
   let observerStarted = false;
   let hiddenCount = 0;
-  let toggleDragState = null;
-  let suppressToggleClickUntil = 0;
 
   let dataRefreshInFlight = false;
   let dataRefreshTimer = null;
   let dataRefreshQueued = false;
   let dataRefreshDebounceTimer = null;
+  let autoRefreshEnabled = true;
+  let autoRefreshIdleSeconds = AUTO_REFRESH_DEFAULT_IDLE_SECONDS;
+  let autoRefreshTimer = null;
+  let lastUserActivityTs = Date.now();
+  let lastKnownUrl = window.location.href;
+  let topBarMountObserver = null;
+  let soundAlertsEnabled = true;
+  let needAckSoundBaselineReady = false;
+  let previousNeedAckAlertIds = new Set();
+  let lastNeedAckChimeAt = 0;
 
   // child maps
   const childOldNoNoteById = new Map();
@@ -47,6 +62,50 @@
   const groupHasOldNoNoteBySubject = new Map();
   const groupHasAnyNoteBySubject = new Map();
   const lastResolvedParentStateBySubject = new Map();
+
+  function isActionPage() {
+    return window.location.pathname === '/action';
+  }
+
+  /** Только дашборд: автоперезагрузка по простою не трогает /action и др. */
+  function isDashboardHome() {
+    return window.location.pathname === '/';
+  }
+
+  function uncheckActionNotificationCheckbox() {
+    if (!isActionPage()) return;
+
+    const notifyInputs = document.querySelectorAll(
+      'input[type="checkbox"][ng-model], input[type="checkbox"][data-ng-model], input[type="checkbox"][x-ng-model]'
+    );
+    notifyInputs.forEach((input) => {
+      const model =
+        input.getAttribute('ng-model') ||
+        input.getAttribute('data-ng-model') ||
+        input.getAttribute('x-ng-model') ||
+        '';
+
+      if (!/notify/i.test(model) || !input.checked) return;
+
+      // Для Angular-наблюдателей надежнее вызвать нативный click,
+      // чтобы framework корректно обновил модель.
+      input.click();
+
+      // Fallback: если после click состояние не изменилось, принудительно снимаем чекбокс.
+      if (!input.checked) return;
+
+      input.checked = false;
+      input.removeAttribute('checked');
+
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  function applyActionPageTweaks() {
+    if (!isActionPage()) return;
+    uncheckActionNotificationCheckbox();
+  }
 
   function injectStyles() {
     if (document.getElementById('bosun-silence-hider-styles')) return;
@@ -184,48 +243,223 @@
         vertical-align: middle;
       }
 
-      #${TOGGLE_ID} {
-        position: fixed;
-        top: ${TOGGLE_TOP};
-        right: ${TOGGLE_RIGHT};
-        z-index: 2147483647;
-        background: #1f2937;
-        color: #fff;
-        border: 0;
-        border-radius: 10px;
-        padding: 10px 14px;
-        font: 13px/1.2 Arial, sans-serif;
-        cursor: pointer;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        user-select: none;
-        -webkit-user-select: none;
+      /* Центр шапки: абсолютное позиционирование внутри #navbar-collapse */
+      .navbar.navbar-default .navbar-collapse {
+        position: relative;
+      }
+
+      /* Бренд слева должен быть выше тулбара по z-index — иначе мышь попадает в «дырку»
+         pointer-events и зона клика не совпадает с текстом ссылки */
+      .navbar.navbar-default .navbar-header {
+        position: relative;
+        z-index: 12;
+      }
+
+      .navbar.navbar-default .navbar-brand {
+        position: relative;
+        z-index: 13;
+      }
+
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 2;
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        max-width: calc(100% - 32px);
+        pointer-events: none;
+      }
+
+      /* Иначе широкий flex-блок перехватывает клики по бренду слева */
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center .bosun-top-controls-inner,
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center .bosun-top-controls-actions {
+        pointer-events: none;
+      }
+
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center label,
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center button,
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center input,
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center #${AUTO_REFRESH_COUNTDOWN_ID} {
         pointer-events: auto;
       }
 
+      div#${TOP_BAR_ID}.bosun-toolbar-fallback {
+        width: 95%;
+        margin: 0 auto 14px auto;
+        padding: 0;
+        box-sizing: border-box;
+        min-height: 60px;
+      }
+
+      #${TOP_BAR_ID} .bosun-top-controls-inner {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      div#${TOP_BAR_ID}.bosun-toolbar-navbar-center .bosun-top-controls-inner {
+        padding: 0 8px;
+        margin: 0;
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        min-height: auto;
+      }
+
+      div#${TOP_BAR_ID}.bosun-toolbar-fallback .bosun-top-controls-inner {
+        min-height: 42px;
+        padding: 8px 12px;
+        gap: 12px;
+        justify-content: space-between;
+        background: #f8f8f8;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+      }
+
+      div#${TOP_BAR_ID}.bosun-toolbar-fallback .bosun-top-controls-title {
+        color: #555;
+        font-size: 12px;
+        line-height: 1.4;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      #${TOP_BAR_ID} .bosun-top-controls-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      #${TOP_BAR_ID} .bosun-auto-refresh-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      #${TOP_BAR_ID} .bosun-auto-refresh-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 30px;
+        margin: 0;
+        color: #333;
+        font-weight: 500;
+      }
+
+      #${AUTO_REFRESH_TOGGLE_ID} {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        vertical-align: middle;
+      }
+
+      #${SOUND_ALERTS_TOGGLE_ID} {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        vertical-align: middle;
+      }
+
+      #${TOP_BAR_ID} .bosun-auto-refresh-seconds {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin: 0;
+        color: #555;
+      }
+
+      #${AUTO_REFRESH_INPUT_ID} {
+        width: 72px;
+        height: 30px;
+        padding: 4px 6px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      #${AUTO_REFRESH_COUNTDOWN_ID} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 46px;
+        height: 30px;
+        padding: 0 10px;
+        border: 1px solid #d0d0d0;
+        border-radius: 999px;
+        background: #fff;
+        color: #666;
+        font-weight: 600;
+      }
+
+      #${TOGGLE_ID} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 170px;
+        min-height: 30px;
+        padding: 4px 12px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        line-height: 1.4;
+        font-weight: 400;
+        cursor: pointer;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
       #${TOGGLE_ID}:hover {
-        opacity: 0.95;
+        background: #f5f5f5;
+        border-color: #adadad;
       }
 
       #${TOGGLE_ID}:focus {
-        outline: 2px solid rgba(255,255,255,0.35);
-        outline-offset: 2px;
+        outline: none;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15), 0 0 0 2px rgba(102,175,233,.35);
+      }
+
+      #${TOGGLE_ID}.is-active {
+        background: #e6e6e6;
+        border-color: #adadad;
+      }
+
+      #${TOGGLE_COUNTER_ID} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        height: 30px;
+        padding: 0 10px;
+        border-radius: 15px;
+        background: #337ab7;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.4;
+        user-select: none;
+        -webkit-user-select: none;
       }
 
       #${TOGGLE_ID} .bosun-silence-label {
         display: inline-block;
-        pointer-events: none;
-      }
-
-      #${TOGGLE_ID} .bosun-silence-badge {
-        display: inline-block;
-        min-width: 22px;
-        padding: 2px 7px;
-        border-radius: 999px;
-        background: rgba(255, 255, 255, 0.18);
-        font-weight: bold;
+        width: 100%;
         text-align: center;
         pointer-events: none;
       }
@@ -581,6 +815,7 @@
       ensureCopyButtons();
       markNoSelectElements();
       refreshSilencedBadges();
+      applyActionPageTweaks();
 
       // Быстрый локальный repaint по текущим index maps,
       // но без удаления значков, если DOM ещё не устаканился.
@@ -602,9 +837,181 @@
     chrome.storage.local.set({ [STORAGE_KEY]: showSilenced });
   }
 
-  function saveTogglePosition() {
-    if (!chrome?.storage?.local || !togglePosition) return;
-    chrome.storage.local.set({ [TOGGLE_POSITION_KEY]: togglePosition });
+  function normalizeAutoRefreshIdleSeconds(value) {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return AUTO_REFRESH_DEFAULT_IDLE_SECONDS;
+
+    return Math.min(
+      AUTO_REFRESH_MAX_IDLE_SECONDS,
+      Math.max(AUTO_REFRESH_MIN_IDLE_SECONDS, Math.round(numericValue))
+    );
+  }
+
+  function saveAutoRefreshState() {
+    if (!chrome?.storage?.local) return;
+    chrome.storage.local.set({
+      [AUTO_REFRESH_ENABLED_KEY]: autoRefreshEnabled,
+      [AUTO_REFRESH_IDLE_SECONDS_KEY]: autoRefreshIdleSeconds
+    });
+  }
+
+  function saveSoundAlertsState() {
+    if (!chrome?.storage?.local) return;
+    chrome.storage.local.set({ [SOUND_ALERTS_ENABLED_KEY]: soundAlertsEnabled });
+  }
+
+  function resetNeedAckSoundBaseline() {
+    needAckSoundBaselineReady = false;
+    previousNeedAckAlertIds = new Set();
+  }
+
+  function normalizeNeedAckChildren(raw) {
+    if (raw == null) return [];
+    if (Array.isArray(raw)) return raw;
+    return [raw];
+  }
+
+  function parseNeedAckStatusToBucket(raw) {
+    const s = String(raw ?? '').toLowerCase().trim();
+    if (s === 'critical') return 'critical';
+    if (s === 'warning') return 'warning';
+    if (s === 'unknown') return 'unknown';
+    if (s === 'normal' || s === 'none' || !s) return 'unknown';
+    if (s.includes('crit')) return 'critical';
+    if (s.includes('warn')) return 'warning';
+    return 'unknown';
+  }
+
+  /** В шаблоне Bosun у группы есть CurrentStatus; у ребёнка — State.* и Events[].Status */
+  function getNeedAckSeverityBucket(child, group) {
+    const state = child?.State || {};
+    const events = Array.isArray(state.Events) ? state.Events : [];
+    const lastEv = events.length ? events[events.length - 1] : null;
+    const fromChild =
+      state.CurrentStatus ??
+      state.WorstStatus ??
+      state.LastAbnormalStatus ??
+      lastEv?.Status ??
+      '';
+    let bucket = parseNeedAckStatusToBucket(fromChild);
+    if (bucket === 'unknown' && !String(fromChild).trim() && group) {
+      const fromGroup =
+        group.CurrentStatus ??
+        group.WorstStatus ??
+        group.Status ??
+        '';
+      bucket = parseNeedAckStatusToBucket(fromGroup);
+    }
+    return bucket;
+  }
+
+  function getNeedAckSeverityFromGroupOnly(group) {
+    const raw =
+      group?.CurrentStatus ??
+      group?.WorstStatus ??
+      group?.Status ??
+      '';
+    return parseNeedAckStatusToBucket(raw);
+  }
+
+  /** Стабильный ключ: Id из State, иначе Subject/AlertKey (как в UI «N alerts» в группе) */
+  function needAckStableKey(child, group) {
+    const state = child?.State;
+    const id = state?.Id;
+    if (id != null && String(id).trim() !== '') {
+      return `id:${String(id)}`;
+    }
+    const groupSub = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
+    const sub =
+      (typeof child?.Subject === 'string' && child.Subject.trim()) ||
+      (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
+      '';
+    const alertKey =
+      (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
+      (state && typeof state.Alert === 'string' && state.Alert.trim()) ||
+      '';
+    const tags = state && typeof state.Tags === 'string' ? state.Tags.trim() : '';
+    if (groupSub && sub) return `k:${groupSub}|${sub}`;
+    if (groupSub && alertKey) return `k:${groupSub}|ak:${alertKey}`;
+    if (alertKey && tags) return `k:ak:${alertKey}|t:${tags}`;
+    if (sub) return `k:s:${sub}`;
+    if (groupSub) return `k:g:${groupSub}`;
+    return null;
+  }
+
+  function playNeedAckChime(kind) {
+    if (!soundAlertsEnabled || !chrome?.runtime?.getURL) return;
+
+    const now = Date.now();
+    if (now - lastNeedAckChimeAt < 450) return;
+    lastNeedAckChimeAt = now;
+
+    const file = kind === 'alert' ? SOUND_FILE_ALERT : SOUND_FILE_SOFT;
+    const audio = new Audio(chrome.runtime.getURL(file));
+    audio.volume = 0.85;
+    audio.play().catch(() => {});
+  }
+
+  function processNeedAckNewAlertSounds(payload) {
+    if (!soundAlertsEnabled) return;
+
+    const groups = payload?.Groups?.NeedAck;
+    if (!Array.isArray(groups)) return;
+
+    const currentIds = new Set();
+    const idToSeverity = new Map();
+
+    for (const group of groups) {
+      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
+      const children = normalizeNeedAckChildren(group?.Children);
+
+      if (!children.length && groupSubject) {
+        const key = `grp:${groupSubject}`;
+        currentIds.add(key);
+        idToSeverity.set(key, getNeedAckSeverityFromGroupOnly(group));
+        continue;
+      }
+
+      let anyChildKey = false;
+      for (const child of children) {
+        const key = needAckStableKey(child, group);
+        if (!key) continue;
+        anyChildKey = true;
+        currentIds.add(key);
+        idToSeverity.set(key, getNeedAckSeverityBucket(child, group));
+      }
+      if (!anyChildKey && groupSubject) {
+        const key = `grp:${groupSubject}`;
+        currentIds.add(key);
+        idToSeverity.set(key, getNeedAckSeverityFromGroupOnly(group));
+      }
+    }
+
+    if (!needAckSoundBaselineReady) {
+      previousNeedAckAlertIds = currentIds;
+      needAckSoundBaselineReady = true;
+      return;
+    }
+
+    const newIds = [];
+    for (const id of currentIds) {
+      if (!previousNeedAckAlertIds.has(id)) newIds.push(id);
+    }
+    previousNeedAckAlertIds = currentIds;
+
+    if (!newIds.length) return;
+
+    let hasAlertChime = false;
+    let hasSoft = false;
+    for (const id of newIds) {
+      const bucket = idToSeverity.get(id) || 'unknown';
+      if (bucket === 'critical' || bucket === 'unknown') hasAlertChime = true;
+      else if (bucket === 'warning') hasSoft = true;
+      else hasSoft = true;
+    }
+
+    if (hasAlertChime) playNeedAckChime('alert');
+    else if (hasSoft) playNeedAckChime('soft');
   }
 
   function loadState(callback) {
@@ -613,54 +1020,44 @@
       return;
     }
 
-    chrome.storage.local.get([STORAGE_KEY, TOGGLE_POSITION_KEY], (result) => {
-      if (!chrome.runtime?.lastError && typeof result[STORAGE_KEY] === 'boolean') {
-        showSilenced = result[STORAGE_KEY];
-      }
-      const savedPos = result[TOGGLE_POSITION_KEY];
-      if (
-        savedPos &&
-        Number.isFinite(savedPos.left) &&
-        Number.isFinite(savedPos.top)
-      ) {
-        togglePosition = { left: savedPos.left, top: savedPos.top };
-      }
+    chrome.storage.local.get(
+      [STORAGE_KEY, AUTO_REFRESH_ENABLED_KEY, AUTO_REFRESH_IDLE_SECONDS_KEY, SOUND_ALERTS_ENABLED_KEY],
+      (result) => {
+      showSilenced = Boolean(result[STORAGE_KEY]);
+      autoRefreshEnabled = typeof result[AUTO_REFRESH_ENABLED_KEY] === 'boolean'
+        ? result[AUTO_REFRESH_ENABLED_KEY]
+        : true;
+      autoRefreshIdleSeconds = normalizeAutoRefreshIdleSeconds(result[AUTO_REFRESH_IDLE_SECONDS_KEY]);
+      soundAlertsEnabled = typeof result[SOUND_ALERTS_ENABLED_KEY] === 'boolean'
+        ? result[SOUND_ALERTS_ENABLED_KEY]
+        : true;
       callback();
-    });
+      }
+    );
   }
 
   function updateToggleText() {
     const btn = document.getElementById(TOGGLE_ID);
+    const counter = document.getElementById(TOGGLE_COUNTER_ID);
     if (!btn) return;
 
     const labelNode = btn.querySelector('.bosun-silence-label');
-    const badgeNode = btn.querySelector('.bosun-silence-badge');
-    if (!labelNode || !badgeNode) return;
+    if (!labelNode || !counter) return;
 
     if (showSilenced) {
       labelNode.textContent = 'Скрыть silenced alerts';
-      badgeNode.style.display = 'none';
-      badgeNode.textContent = '';
+      btn.classList.add('is-active');
+      counter.style.visibility = 'hidden';
+      counter.textContent = '';
     } else {
       labelNode.textContent = 'Показать silenced alerts';
-      badgeNode.style.display = 'inline-block';
-      badgeNode.textContent = String(hiddenCount);
-    }
-  }
-
-  function swallowPointerStart(e) {
-    e.stopPropagation();
-    if (typeof e.stopImmediatePropagation === 'function') {
-      e.stopImmediatePropagation();
+      btn.classList.remove('is-active');
+      counter.style.visibility = 'visible';
+      counter.textContent = String(hiddenCount);
     }
   }
 
   function handleToggleClick(e) {
-    if (Date.now() < suppressToggleClickUntil) {
-      e.preventDefault();
-      return;
-    }
-
     e.preventDefault();
     e.stopPropagation();
     if (typeof e.stopImmediatePropagation === 'function') {
@@ -672,106 +1069,306 @@
     applyVisibility();
   }
 
-  function applyTogglePosition(btn, left, top) {
-    const maxLeft = Math.max(0, window.innerWidth - btn.offsetWidth);
-    const maxTop = Math.max(0, window.innerHeight - btn.offsetHeight);
-    const clampedLeft = Math.min(Math.max(0, left), maxLeft);
-    const clampedTop = Math.min(Math.max(0, top), maxTop);
-
-    btn.style.left = `${clampedLeft}px`;
-    btn.style.top = `${clampedTop}px`;
-    btn.style.right = 'auto';
-    togglePosition = { left: clampedLeft, top: clampedTop };
+  function markUserActivity() {
+    lastUserActivityTs = Date.now();
+    updateAutoRefreshCountdown();
   }
 
-  function handleTogglePointerDown(e) {
-    if (e.button !== 0) return;
-
-    const btn = e.currentTarget;
-    const rect = btn.getBoundingClientRect();
-    toggleDragState = {
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      originLeft: rect.left,
-      originTop: rect.top,
-      moved: false
-    };
-
-    btn.setPointerCapture?.(e.pointerId);
-    swallowPointerStart(e);
+  function getAutoRefreshRemainingSeconds() {
+    const elapsedSeconds = (Date.now() - lastUserActivityTs) / 1000;
+    return Math.max(0, Math.ceil(autoRefreshIdleSeconds - elapsedSeconds));
   }
 
-  function handleTogglePointerMove(e) {
-    if (!toggleDragState || toggleDragState.pointerId !== e.pointerId) return;
+  function updateAutoRefreshCountdown() {
+    const countdown = document.getElementById(AUTO_REFRESH_COUNTDOWN_ID);
+    if (!countdown) return;
 
-    const btn = e.currentTarget;
-    const dx = e.clientX - toggleDragState.startX;
-    const dy = e.clientY - toggleDragState.startY;
-
-    if (!toggleDragState.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
-      toggleDragState.moved = true;
-    }
-
-    if (!toggleDragState.moved) return;
-
-    applyTogglePosition(btn, toggleDragState.originLeft + dx, toggleDragState.originTop + dy);
-    e.preventDefault();
-  }
-
-  function finishToggleDrag(e) {
-    if (!toggleDragState || toggleDragState.pointerId !== e.pointerId) return;
-
-    const moved = toggleDragState.moved;
-    toggleDragState = null;
-
-    if (moved) {
-      saveTogglePosition();
-      suppressToggleClickUntil = Date.now() + 250;
-      e.preventDefault();
-      e.stopPropagation();
-      if (typeof e.stopImmediatePropagation === 'function') {
-        e.stopImmediatePropagation();
-      }
-    }
-  }
-
-  function ensureToggleExists() {
-    let btn = document.getElementById(TOGGLE_ID);
-    if (btn) {
-      if (togglePosition) {
-        applyTogglePosition(btn, togglePosition.left, togglePosition.top);
-      }
-      updateToggleText();
+    if (!autoRefreshEnabled) {
+      countdown.textContent = 'off';
+      countdown.title = 'Отключить автообновление';
       return;
     }
 
-    btn = document.createElement('button');
-    btn.id = TOGGLE_ID;
-    btn.type = 'button';
+    if (!isDashboardHome()) {
+      countdown.textContent = '—';
+      countdown.title = 'Автообновление страницы только на главной /';
+      return;
+    }
 
-    const label = document.createElement('span');
-    label.className = 'bosun-silence-label';
+    countdown.title = 'Отключить автообновление';
+    countdown.textContent = `${getAutoRefreshRemainingSeconds()}s`;
+  }
 
-    const badge = document.createElement('span');
-    badge.className = 'bosun-silence-badge';
+  function updateAutoRefreshControls() {
+    const toggle = document.getElementById(AUTO_REFRESH_TOGGLE_ID);
+    const input = document.getElementById(AUTO_REFRESH_INPUT_ID);
+    if (!toggle || !input) return;
 
-    btn.appendChild(label);
-    btn.appendChild(badge);
+    toggle.checked = autoRefreshEnabled;
+    if (document.activeElement !== input) {
+      input.value = String(autoRefreshIdleSeconds);
+    }
+    updateAutoRefreshCountdown();
+  }
 
-    ['mousedown', 'touchstart'].forEach((evt) => {
-      btn.addEventListener(evt, swallowPointerStart, true);
+  function handleAutoRefreshToggleChange(e) {
+    autoRefreshEnabled = Boolean(e.target.checked);
+    markUserActivity();
+    saveAutoRefreshState();
+    updateAutoRefreshControls();
+  }
+
+  function handleAutoRefreshIdleChange(e) {
+    autoRefreshIdleSeconds = normalizeAutoRefreshIdleSeconds(e.target.value);
+    markUserActivity();
+    saveAutoRefreshState();
+    updateAutoRefreshControls();
+  }
+
+  function handleAutoRefreshIdleInput(e) {
+    const numericValue = Number(e.target.value);
+    if (!Number.isFinite(numericValue) || numericValue <= 0) return;
+
+    // Во время ввода не clamping до min/max, чтобы не мешать набору.
+    autoRefreshIdleSeconds = Math.round(numericValue);
+    markUserActivity();
+  }
+
+  function handleAutoRefreshIdleKeydown(e) {
+    if (e.key !== 'Enter') return;
+
+    e.preventDefault();
+    e.currentTarget.blur();
+  }
+
+  function handleAutoRefreshCountdownClick() {
+    if (!autoRefreshEnabled) return;
+
+    autoRefreshEnabled = false;
+    markUserActivity();
+    saveAutoRefreshState();
+    updateAutoRefreshControls();
+  }
+
+  function updateSoundAlertsControl() {
+    const cb = document.getElementById(SOUND_ALERTS_TOGGLE_ID);
+    if (cb) cb.checked = soundAlertsEnabled;
+  }
+
+  function handleSoundAlertsToggle(e) {
+    soundAlertsEnabled = Boolean(e.target.checked);
+    saveSoundAlertsState();
+    resetNeedAckSoundBaseline();
+    updateSoundAlertsControl();
+  }
+
+  function ensureSoundAlertsControls(actions) {
+    let wrap = actions.querySelector('.bosun-sound-alerts-wrap');
+    if (!wrap) {
+      wrap = document.createElement('label');
+      wrap.className = 'bosun-auto-refresh-label bosun-sound-alerts-wrap';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = SOUND_ALERTS_TOGGLE_ID;
+      cb.addEventListener('change', handleSoundAlertsToggle);
+      wrap.appendChild(cb);
+      wrap.appendChild(document.createTextNode('Звуковое оповещение'));
+      actions.appendChild(wrap);
+    }
+    updateSoundAlertsControl();
+  }
+
+  function ensureAutoRefreshControls(actions) {
+    let group = actions.querySelector('.bosun-auto-refresh-group');
+    if (!group) {
+      group = document.createElement('div');
+      group.className = 'bosun-auto-refresh-group';
+
+      const toggleLabel = document.createElement('label');
+      toggleLabel.className = 'bosun-auto-refresh-label';
+      const toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.id = AUTO_REFRESH_TOGGLE_ID;
+      toggle.addEventListener('change', handleAutoRefreshToggleChange);
+      toggleLabel.appendChild(toggle);
+      toggleLabel.appendChild(document.createTextNode('Автообновление,'));
+
+      const secondsLabel = document.createElement('label');
+      secondsLabel.className = 'bosun-auto-refresh-seconds';
+      secondsLabel.setAttribute('for', AUTO_REFRESH_INPUT_ID);
+      secondsLabel.appendChild(document.createTextNode('сек'));
+      const input = document.createElement('input');
+      input.id = AUTO_REFRESH_INPUT_ID;
+      input.type = 'number';
+      input.min = String(AUTO_REFRESH_MIN_IDLE_SECONDS);
+      input.max = String(AUTO_REFRESH_MAX_IDLE_SECONDS);
+      input.step = '1';
+      input.addEventListener('input', handleAutoRefreshIdleInput);
+      input.addEventListener('change', handleAutoRefreshIdleChange);
+      input.addEventListener('keydown', handleAutoRefreshIdleKeydown);
+      secondsLabel.appendChild(input);
+
+      group.appendChild(toggleLabel);
+      group.appendChild(secondsLabel);
+      const countdown = document.createElement('span');
+      countdown.id = AUTO_REFRESH_COUNTDOWN_ID;
+      countdown.style.cursor = 'pointer';
+      countdown.title = 'Отключить автообновление';
+      countdown.addEventListener('click', handleAutoRefreshCountdownClick);
+      group.appendChild(countdown);
+      actions.appendChild(group);
+    }
+
+    updateAutoRefreshControls();
+  }
+
+  function maybeAutoRefreshPage() {
+    if (!autoRefreshEnabled || !isDashboardHome()) return;
+    if (Date.now() - lastUserActivityTs < autoRefreshIdleSeconds * 1000) return;
+
+    window.location.reload();
+  }
+
+  function startAutoRefreshLoop() {
+    if (autoRefreshTimer) return;
+
+    autoRefreshTimer = setInterval(() => {
+      const currentUrl = window.location.href;
+      if (currentUrl !== lastKnownUrl) {
+        lastKnownUrl = currentUrl;
+        markUserActivity();
+        resetNeedAckSoundBaseline();
+      }
+
+      updateAutoRefreshCountdown();
+      maybeAutoRefreshPage();
+    }, 1000);
+  }
+
+  function installUserActivityTracking() {
+    const activityEvents = ['keydown'];
+    activityEvents.forEach((eventName) => {
+      window.addEventListener(eventName, markUserActivity, { passive: true, capture: true });
     });
+  }
 
-    btn.addEventListener('pointerdown', handleTogglePointerDown, true);
-    btn.addEventListener('pointermove', handleTogglePointerMove, true);
-    btn.addEventListener('pointerup', finishToggleDrag, true);
-    btn.addEventListener('pointercancel', finishToggleDrag, true);
-    btn.addEventListener('click', handleToggleClick, true);
+  function findMainContentAnchor() {
+    return (
+      document.querySelector('body > .container[style*="width: 95%"]') ||
+      document.querySelector('body > .container') ||
+      document.body?.querySelector('.container') ||
+      null
+    );
+  }
 
-    document.body.appendChild(btn);
-    if (togglePosition) {
-      applyTogglePosition(btn, togglePosition.left, togglePosition.top);
+  function disconnectTopBarMountObserver() {
+    if (topBarMountObserver) {
+      topBarMountObserver.disconnect();
+      topBarMountObserver = null;
+    }
+  }
+
+  function scheduleTopBarMount() {
+    const tryMount = () => {
+      ensureToggleExists();
+      return !!document.getElementById(TOP_BAR_ID);
+    };
+
+    if (tryMount()) return;
+
+    if (topBarMountObserver) return;
+
+    topBarMountObserver = new MutationObserver(() => {
+      if (tryMount()) {
+        disconnectTopBarMountObserver();
+      }
+    });
+    topBarMountObserver.observe(document.documentElement, { childList: true, subtree: true });
+    requestAnimationFrame(tryMount);
+  }
+
+  function ensureTopBarExists() {
+    let bar = document.getElementById(TOP_BAR_ID);
+    if (bar) return bar;
+
+    const collapse =
+      document.getElementById('navbar-collapse') ||
+      document.querySelector('.navbar.navbar-default .navbar-collapse');
+
+    if (collapse) {
+      const rightNav = collapse.querySelector('ul.nav.navbar-nav.navbar-right');
+      if (rightNav) {
+        bar = document.createElement('div');
+        bar.id = TOP_BAR_ID;
+        bar.className = 'bosun-toolbar-navbar-center';
+        bar.innerHTML = `
+          <div class="bosun-top-controls-inner">
+            <div class="bosun-top-controls-actions"></div>
+          </div>
+        `;
+        collapse.insertBefore(bar, rightNav);
+        return bar;
+      }
+    }
+
+    const navbar = document.querySelector('.navbar.navbar-default.navbar-static-top');
+    const contentContainer = findMainContentAnchor();
+    if (!contentContainer) return null;
+
+    bar = document.createElement('div');
+    bar.id = TOP_BAR_ID;
+    bar.className = 'bosun-toolbar-fallback';
+    bar.innerHTML = `
+      <div class="bosun-top-controls-inner">
+        <div class="bosun-top-controls-title">Bosun Silence Hider</div>
+        <div class="bosun-top-controls-actions"></div>
+      </div>
+    `;
+
+    if (navbar && navbar.nextSibling) {
+      navbar.parentNode.insertBefore(bar, navbar.nextSibling);
+    } else {
+      contentContainer.parentNode.insertBefore(bar, contentContainer);
+    }
+
+    return bar;
+  }
+
+  function getTopBarActionsContainer() {
+    const bar = ensureTopBarExists();
+    return bar?.querySelector('.bosun-top-controls-actions') || null;
+  }
+
+  function ensureToggleExists() {
+    const actions = getTopBarActionsContainer();
+    if (!actions) return;
+    ensureSoundAlertsControls(actions);
+    ensureAutoRefreshControls(actions);
+
+    let btn = document.getElementById(TOGGLE_ID);
+    let counter = document.getElementById(TOGGLE_COUNTER_ID);
+
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.id = TOGGLE_ID;
+      btn.type = 'button';
+
+      const label = document.createElement('span');
+      label.className = 'bosun-silence-label';
+      btn.appendChild(label);
+      btn.addEventListener('click', handleToggleClick, true);
+    }
+
+    if (!counter) {
+      counter = document.createElement('span');
+      counter.id = TOGGLE_COUNTER_ID;
+    }
+
+    if (btn.parentElement !== actions) {
+      actions.appendChild(btn);
+    }
+    if (counter.parentElement !== actions) {
+      actions.appendChild(counter);
     }
     updateToggleText();
   }
@@ -1206,6 +1803,7 @@
       }
 
       rebuildAlertDataIndex(payload);
+      processNeedAckNewAlertSounds(payload);
       applyNeedsAckMarkersFromData();
       ensureCopyButtons();
       markNoSelectElements();
@@ -1248,6 +1846,7 @@
 
         if (!target) continue;
         if (target.id === TOGGLE_ID || target.closest?.(`#${TOGGLE_ID}`)) continue;
+        if (target.id === TOP_BAR_ID || target.closest?.(`#${TOP_BAR_ID}`)) continue;
         if (target.classList?.contains(OLD_NO_NOTE_ICON_CLASS) || target.closest?.(`.${OLD_NO_NOTE_ICON_CLASS}`)) continue;
         if (target.classList?.contains(HAS_NOTE_ICON_CLASS) || target.closest?.(`.${HAS_NOTE_ICON_CLASS}`)) continue;
 
@@ -1278,16 +1877,21 @@
   function init() {
     injectStyles();
     installSelectionGuard();
+    installUserActivityTracking();
+    scheduleTopBarMount();
 
     loadState(() => {
+      markUserActivity();
       ensureToggleExists();
       applyVisibility();
       ensureCopyButtons();
       markNoSelectElements();
       refreshSilencedBadges();
+      applyActionPageTweaks();
       startObserver();
       refreshAlertsData();
       startDataRefreshLoop();
+      startAutoRefreshLoop();
 
       setTimeout(() => {
         ensureToggleExists();
@@ -1295,6 +1899,7 @@
         ensureCopyButtons();
         markNoSelectElements();
         refreshSilencedBadges();
+        applyActionPageTweaks();
         refreshAlertsData();
       }, 1000);
     });
