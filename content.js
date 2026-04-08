@@ -13,6 +13,13 @@
   const AUTO_REFRESH_COUNTDOWN_ID = 'bosun-auto-refresh-countdown';
   const SOUND_ALERTS_ENABLED_KEY = 'bosunSoundAlertsEnabled';
   const SOUND_ALERTS_TOGGLE_ID = 'bosun-sound-alerts-toggle';
+  const SOUND_TEST_BUTTON_ID = 'bosun-sound-test-button';
+  const DIAGNOSTICS_ENABLED_KEY = 'bosunDiagnosticsEnabled';
+  const DIAGNOSTICS_TOGGLE_ID = 'bosun-diagnostics-toggle';
+  const DIAGNOSTICS_OPEN_BUTTON_ID = 'bosun-diagnostics-open-button';
+  const DIAGNOSTICS_MODAL_ID = 'bosun-diagnostics-modal';
+  const DIAGNOSTICS_LOG_LIST_ID = 'bosun-diagnostics-log-list';
+  const DIAGNOSTICS_LOG_STORAGE_KEY = 'bosunDiagnosticsLogV1';
   const NEED_ACK_SOUND_BASELINE_SESSION_KEY = 'bosunNeedAckSoundBaselineV1';
   const SOUND_FILE_ALERT = 'bosun_notification_alert_chime.wav';
   const SOUND_FILE_SOFT = 'bosun_notification_soft_chime.wav';
@@ -32,6 +39,7 @@
   const AUTO_REFRESH_DEFAULT_IDLE_SECONDS = 60;
   const AUTO_REFRESH_MIN_IDLE_SECONDS = 10;
   const AUTO_REFRESH_MAX_IDLE_SECONDS = 3600;
+  const AUTO_REFRESH_FORCE_REENABLE_MS = 10 * 60 * 1000;
 
   let showSilenced = false;
   let refreshTimer = null;
@@ -45,24 +53,39 @@
   let autoRefreshEnabled = true;
   let autoRefreshIdleSeconds = AUTO_REFRESH_DEFAULT_IDLE_SECONDS;
   let autoRefreshTimer = null;
+  let autoRefreshReEnableTimer = null;
   let lastUserActivityTs = Date.now();
   let lastKnownUrl = window.location.href;
   let topBarMountObserver = null;
   let soundAlertsEnabled = true;
+  let diagnosticsEnabled = false;
   let needAckSoundBaselineReady = false;
   let previousNeedAckAlertIds = new Set();
+  let previousNeedAckSnapshotSize = 0;
   let lastNeedAckChimeAt = 0;
+  let needAckRefreshAttempts = 0;
+  let needAckMissingCount = 0;
+  let audioUnlocked = false;
+  let pendingNeedAckChimeKind = null;
+  let pendingNeedAckRetryAttached = false;
+  let alertChimeAudio = null;
+  let softChimeAudio = null;
+  let diagnosticsModalOpen = false;
+  let diagnosticsLogEntries = [];
+  const DIAGNOSTICS_LOG_MAX_ENTRIES = 750;
 
   // child maps
   const childOldNoNoteById = new Map();
-  const childOldNoNoteBySubject = new Map();
+  const childOldNoNoteByKey = new Map();
   const childHasNoteById = new Map();
-  const childHasNoteBySubject = new Map();
+  const childHasNoteByKey = new Map();
 
   // group maps
+  const groupHasOldNoNoteByKey = new Map();
+  const groupHasAnyNoteByKey = new Map();
   const groupHasOldNoNoteBySubject = new Map();
   const groupHasAnyNoteBySubject = new Map();
-  const lastResolvedParentStateBySubject = new Map();
+  const lastResolvedParentStateByKey = new Map();
 
   function isActionPage() {
     return window.location.pathname === '/action';
@@ -344,6 +367,15 @@
         flex-wrap: wrap;
       }
 
+      #${TOP_BAR_ID} .bosun-diagnostics-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-left: auto;
+        padding-left: 10px;
+        border-left: 1px solid #d8d8d8;
+      }
+
       #${TOP_BAR_ID} .bosun-auto-refresh-group {
         display: inline-flex;
         align-items: center;
@@ -372,6 +404,133 @@
         height: 14px;
         margin: 0;
         vertical-align: middle;
+      }
+
+      #${SOUND_TEST_BUTTON_ID} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 30px;
+        padding: 4px 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        line-height: 1.2;
+        cursor: pointer;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+      }
+
+      #${SOUND_TEST_BUTTON_ID}:hover {
+        background: #f5f5f5;
+        border-color: #adadad;
+      }
+
+      #${DIAGNOSTICS_TOGGLE_ID} {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        vertical-align: middle;
+      }
+
+      #${DIAGNOSTICS_OPEN_BUTTON_ID} {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        padding: 4px 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        line-height: 1.2;
+        cursor: pointer;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+      }
+
+      #${DIAGNOSTICS_OPEN_BUTTON_ID}:hover {
+        background: #f5f5f5;
+        border-color: #adadad;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.45);
+      }
+
+      #${DIAGNOSTICS_MODAL_ID}.is-open {
+        display: flex;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-card {
+        width: min(920px, calc(100vw - 32px));
+        max-height: calc(100vh - 48px);
+        display: flex;
+        flex-direction: column;
+        border-radius: 8px;
+        border: 1px solid #d6d6d6;
+        background: #fff;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 10px 12px;
+        border-bottom: 1px solid #ececec;
+        font-size: 13px;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-actions {
+        display: inline-flex;
+        gap: 8px;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-actions button {
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        padding: 3px 10px;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-actions button:hover {
+        background: #f5f5f5;
+        border-color: #adadad;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-body {
+        padding: 0;
+        overflow: auto;
+      }
+
+      #${DIAGNOSTICS_LOG_LIST_ID} {
+        margin: 0;
+        padding: 8px 10px;
+        list-style: none;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      #${DIAGNOSTICS_LOG_LIST_ID} li {
+        padding: 4px 6px;
+        border-radius: 4px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      #${DIAGNOSTICS_LOG_LIST_ID} li:nth-child(odd) {
+        background: #fafafa;
       }
 
       #${TOP_BAR_ID} .bosun-auto-refresh-seconds {
@@ -861,9 +1020,17 @@
     chrome.storage.local.set({ [SOUND_ALERTS_ENABLED_KEY]: soundAlertsEnabled });
   }
 
+  function saveDiagnosticsState() {
+    if (!chrome?.storage?.local) return;
+    chrome.storage.local.set({ [DIAGNOSTICS_ENABLED_KEY]: diagnosticsEnabled });
+  }
+
   function resetNeedAckSoundBaseline() {
     needAckSoundBaselineReady = false;
     previousNeedAckAlertIds = new Set();
+    previousNeedAckSnapshotSize = 0;
+    needAckRefreshAttempts = 0;
+    needAckMissingCount = 0;
     clearNeedAckSoundBaselineSession();
   }
 
@@ -872,7 +1039,8 @@
     try {
       const payload = {
         ready: needAckSoundBaselineReady,
-        ids: Array.from(previousNeedAckAlertIds)
+        ids: Array.from(previousNeedAckAlertIds),
+        size: previousNeedAckSnapshotSize
       };
       window.sessionStorage.setItem(
         NEED_ACK_SOUND_BASELINE_SESSION_KEY,
@@ -890,6 +1058,9 @@
       if (!parsed || parsed.ready !== true || !Array.isArray(parsed.ids)) return;
       previousNeedAckAlertIds = new Set(parsed.ids.filter((id) => typeof id === 'string' && id));
       needAckSoundBaselineReady = true;
+      previousNeedAckSnapshotSize = Number.isFinite(Number(parsed.size))
+        ? Math.max(0, Math.round(Number(parsed.size)))
+        : previousNeedAckAlertIds.size;
     } catch (_) {}
   }
 
@@ -898,6 +1069,83 @@
     try {
       window.sessionStorage.removeItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
     } catch (_) {}
+  }
+
+  function saveDiagnosticsLogToStorage() {
+    if (!window?.localStorage) return;
+    try {
+      const payload = JSON.stringify(diagnosticsLogEntries.slice(-DIAGNOSTICS_LOG_MAX_ENTRIES));
+      window.localStorage.setItem(DIAGNOSTICS_LOG_STORAGE_KEY, payload);
+    } catch (_) {}
+  }
+
+  function restoreDiagnosticsLogFromStorage() {
+    if (!window?.localStorage) return;
+    try {
+      const raw = window.localStorage.getItem(DIAGNOSTICS_LOG_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      diagnosticsLogEntries = parsed
+        .filter((entry) => entry && typeof entry === 'object')
+        .map((entry) => ({
+          time: String(entry.time || ''),
+          event: String(entry.event || 'unknown'),
+          details: String(entry.details || '')
+        }))
+        .slice(-DIAGNOSTICS_LOG_MAX_ENTRIES);
+    } catch (_) {}
+  }
+
+  function formatDiagnosticsTimestamp(date) {
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mm = String(date.getMinutes()).padStart(2, '0');
+    const ss = String(date.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  function renderDiagnosticsLogList() {
+    const list = document.getElementById(DIAGNOSTICS_LOG_LIST_ID);
+    if (!list) return;
+    if (!diagnosticsLogEntries.length) {
+      list.innerHTML = '<li>Лог пуст. Включи "Диагностика" и дождись событий.</li>';
+      return;
+    }
+
+    list.innerHTML = diagnosticsLogEntries
+      .map((entry) => {
+        const details = entry.details ? ` | ${entry.details}` : '';
+        return `<li>[${entry.time}] ${entry.event}${details}</li>`;
+      })
+      .join('');
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function setDiagnosticsModalOpen(isOpen) {
+    const modal = document.getElementById(DIAGNOSTICS_MODAL_ID);
+    if (!modal) return;
+    diagnosticsModalOpen = isOpen;
+    modal.classList.toggle('is-open', isOpen);
+    if (isOpen) renderDiagnosticsLogList();
+  }
+
+  function appendDiagnosticsLog(eventName, details = '') {
+    diagnosticsLogEntries.push({
+      time: formatDiagnosticsTimestamp(new Date()),
+      event: String(eventName || 'unknown'),
+      details: String(details || '')
+    });
+    if (diagnosticsLogEntries.length > DIAGNOSTICS_LOG_MAX_ENTRIES) {
+      diagnosticsLogEntries = diagnosticsLogEntries.slice(-DIAGNOSTICS_LOG_MAX_ENTRIES);
+    }
+    saveDiagnosticsLogToStorage();
+    if (diagnosticsModalOpen) renderDiagnosticsLogList();
+  }
+
+  function reportDiagnostics(eventName, details = '') {
+    if (!diagnosticsEnabled) return;
+    appendDiagnosticsLog(eventName, details);
+    console.debug('[Bosun plugin][diag]', eventName, details);
   }
 
   function normalizeNeedAckChildren(raw) {
@@ -949,49 +1197,223 @@
     return parseNeedAckStatusToBucket(raw);
   }
 
-  /** Стабильный ключ: Id из State, иначе Subject/AlertKey (как в UI «N alerts» в группе) */
+  /** Стабильный ключ: Id -> AlertKey+Tags -> group+child+ago -> fallback */
   function needAckStableKey(child, group) {
-    const state = child?.State;
+    const state = child?.State || {};
     const id = state?.Id;
     if (id != null && String(id).trim() !== '') {
-      return `id:${String(id)}`;
+      return `id:${String(id).trim()}`;
     }
-    const groupSub = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-    const sub =
-      (typeof child?.Subject === 'string' && child.Subject.trim()) ||
-      (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
-      '';
+
     const alertKey =
       (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
-      (state && typeof state.Alert === 'string' && state.Alert.trim()) ||
+      (typeof state?.Alert === 'string' && state.Alert.trim()) ||
       '';
-    const tags = state && typeof state.Tags === 'string' ? state.Tags.trim() : '';
-    if (groupSub && sub) return `k:${groupSub}|${sub}`;
-    if (groupSub && alertKey) return `k:${groupSub}|ak:${alertKey}`;
-    if (alertKey && tags) return `k:ak:${alertKey}|t:${tags}`;
-    if (sub) return `k:s:${sub}`;
-    if (groupSub) return `k:g:${groupSub}`;
+    const tags =
+      typeof state?.Tags === 'string' && state.Tags.trim()
+        ? state.Tags.trim()
+        : '';
+
+    if (alertKey && tags) {
+      return `ak:${alertKey}|tags:${tags}`;
+    }
+
+    if (alertKey) {
+      return `ak:${alertKey}`;
+    }
+
+    const groupSub =
+      typeof group?.Subject === 'string' && group.Subject.trim()
+        ? group.Subject.trim()
+        : '';
+    const childSub =
+      typeof child?.Subject === 'string' && child.Subject.trim()
+        ? child.Subject.trim()
+        : '';
+    const ago =
+      typeof child?.Ago === 'string' && child.Ago.trim()
+        ? child.Ago.trim()
+        : '';
+
+    if (groupSub && childSub && ago) {
+      return `g:${groupSub}|c:${childSub}|ago:${ago}`;
+    }
+
+    if (groupSub && childSub) {
+      return `g:${groupSub}|c:${childSub}`;
+    }
+
+    if (childSub) {
+      return `c:${childSub}`;
+    }
+
+    if (groupSub) {
+      return `g:${groupSub}`;
+    }
+
     return null;
   }
 
+  function ensureAudioObjects() {
+    if (!chrome?.runtime?.getURL) return;
+
+    if (!alertChimeAudio) {
+      alertChimeAudio = new Audio(chrome.runtime.getURL(SOUND_FILE_ALERT));
+      alertChimeAudio.preload = 'auto';
+      alertChimeAudio.volume = 0.85;
+    }
+
+    if (!softChimeAudio) {
+      softChimeAudio = new Audio(chrome.runtime.getURL(SOUND_FILE_SOFT));
+      softChimeAudio.preload = 'auto';
+      softChimeAudio.volume = 0.85;
+    }
+  }
+
+  function unlockAudioOnce() {
+    if (audioUnlocked) return;
+
+    ensureAudioObjects();
+
+    const candidates = [alertChimeAudio, softChimeAudio].filter(Boolean);
+    if (!candidates.length) return;
+
+    const unlockPromises = candidates.map((audio) => {
+      try {
+        audio.muted = true;
+        audio.currentTime = 0;
+        const playPromise = audio.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          return playPromise
+            .then(() => {
+              audio.pause();
+              audio.currentTime = 0;
+              audio.muted = false;
+            })
+            .catch(() => {});
+        }
+      } catch (_) {}
+      return Promise.resolve();
+    });
+
+    Promise.allSettled(unlockPromises).finally(() => {
+      audioUnlocked = true;
+    });
+  }
+
+  function installAudioUnlockTracking() {
+    const onceHandler = () => {
+      unlockAudioOnce();
+      window.removeEventListener('pointerdown', onceHandler, true);
+      window.removeEventListener('keydown', onceHandler, true);
+    };
+
+    window.addEventListener('pointerdown', onceHandler, true);
+    window.addEventListener('keydown', onceHandler, true);
+  }
+
+  function formatPlayError(err) {
+    if (!err) return 'unknown';
+    const name = typeof err?.name === 'string' ? err.name : '';
+    const message = typeof err?.message === 'string' ? err.message : '';
+    if (name && message) return `${name}: ${message}`;
+    return name || message || String(err);
+  }
+
+  function isAutoplayBlockReason(reason) {
+    if (!reason) return false;
+    return /NotAllowedError|gesture|interact/i.test(String(reason));
+  }
+
+  function scheduleNeedAckChimeRetry(kind, reason) {
+    if (!isAutoplayBlockReason(reason)) return;
+
+    // If both kinds are pending, keep the more important alert chime.
+    if (pendingNeedAckChimeKind !== 'alert') {
+      pendingNeedAckChimeKind = kind;
+    }
+
+    if (pendingNeedAckRetryAttached) return;
+    pendingNeedAckRetryAttached = true;
+
+    const retryHandler = () => {
+      window.removeEventListener('pointerdown', retryHandler, true);
+      window.removeEventListener('keydown', retryHandler, true);
+      pendingNeedAckRetryAttached = false;
+
+      const retryKind = pendingNeedAckChimeKind;
+      pendingNeedAckChimeKind = null;
+      if (!retryKind || !soundAlertsEnabled) return;
+
+      unlockAudioOnce();
+      setTimeout(() => {
+        playNeedAckChime(retryKind);
+      }, 0);
+    };
+
+    window.addEventListener('pointerdown', retryHandler, true);
+    window.addEventListener('keydown', retryHandler, true);
+    reportDiagnostics('sound-retry-armed', `kind=${kind}`);
+  }
+
   function playNeedAckChime(kind) {
-    if (!soundAlertsEnabled || !chrome?.runtime?.getURL) return;
+    if (!soundAlertsEnabled) return;
 
     const now = Date.now();
-    if (now - lastNeedAckChimeAt < 450) return;
+    if (now - lastNeedAckChimeAt < 450) {
+      reportDiagnostics('sound-throttled', `kind=${kind}`);
+      return;
+    }
     lastNeedAckChimeAt = now;
 
+    ensureAudioObjects();
+
     const file = kind === 'alert' ? SOUND_FILE_ALERT : SOUND_FILE_SOFT;
-    const audio = new Audio(chrome.runtime.getURL(file));
-    audio.volume = 0.85;
-    audio.play().catch(() => {});
+    const audio = kind === 'alert' ? alertChimeAudio : softChimeAudio;
+    if (!audio) return;
+
+    try {
+      audio.pause();
+      audio.currentTime = 0;
+
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise
+          .then(() => {
+            reportDiagnostics('sound-played', `kind=${kind}, file=${file}`);
+          })
+          .catch((err) => {
+            const reason = err?.name || err?.message || 'play-error';
+            console.warn('[Bosun plugin] Sound play blocked or failed:', formatPlayError(err), err);
+            // Let retry bypass anti-spam throttle when initial attempt was blocked by autoplay.
+            lastNeedAckChimeAt = 0;
+            scheduleNeedAckChimeRetry(kind, reason);
+            reportDiagnostics('sound-blocked', `kind=${kind}, reason=${reason}`);
+          });
+      }
+    } catch (err) {
+      console.warn('[Bosun plugin] Sound play failed:', formatPlayError(err), err);
+      const reason = err?.name || err?.message || 'play-error';
+      lastNeedAckChimeAt = 0;
+      scheduleNeedAckChimeRetry(kind, reason);
+      reportDiagnostics('sound-blocked', `kind=${kind}, reason=${reason}`);
+    }
   }
 
   function processNeedAckNewAlertSounds(payload) {
-    if (!soundAlertsEnabled) return;
+    needAckRefreshAttempts += 1;
+
+    if (!soundAlertsEnabled) {
+      reportDiagnostics('sound-disabled', 'toggle=off');
+      return;
+    }
 
     const groups = payload?.Groups?.NeedAck;
-    if (!Array.isArray(groups)) return;
+    if (!Array.isArray(groups)) {
+      needAckMissingCount += 1;
+      reportDiagnostics('needack-missing', 'Groups.NeedAck is not array');
+      return;
+    }
 
     const currentIds = new Set();
     const idToSeverity = new Map();
@@ -1023,9 +1445,42 @@
     }
 
     if (!needAckSoundBaselineReady) {
+      // If endpoint shape was missing on previous refreshes and first valid snapshot
+      // already contains alerts, play one chime so we don't silently miss them.
+      if (needAckMissingCount > 0 && needAckRefreshAttempts > 1 && currentIds.size > 0) {
+        let hasAlertChime = false;
+        let hasSoft = false;
+        for (const id of currentIds) {
+          const bucket = idToSeverity.get(id) || 'unknown';
+          if (bucket === 'critical' || bucket === 'unknown') hasAlertChime = true;
+          else hasSoft = true;
+        }
+        if (hasAlertChime) playNeedAckChime('alert');
+        else if (hasSoft) playNeedAckChime('soft');
+        reportDiagnostics('baseline-init-with-chime', `ids=${currentIds.size}, missingBefore=${needAckMissingCount}`);
+      }
+
       previousNeedAckAlertIds = currentIds;
+      previousNeedAckSnapshotSize = currentIds.size;
       needAckSoundBaselineReady = true;
+      needAckMissingCount = 0;
       persistNeedAckSoundBaselineToSession();
+      reportDiagnostics('baseline-init', `ids=${currentIds.size}`);
+      return;
+    }
+
+    const currentSize = currentIds.size;
+    if (
+      previousNeedAckSnapshotSize > 0 &&
+      currentSize > 0 &&
+      Math.abs(currentSize - previousNeedAckSnapshotSize) >
+        Math.max(5, previousNeedAckSnapshotSize * 0.7)
+    ) {
+      const prevSize = previousNeedAckSnapshotSize;
+      previousNeedAckAlertIds = currentIds;
+      previousNeedAckSnapshotSize = currentSize;
+      persistNeedAckSoundBaselineToSession();
+      reportDiagnostics('baseline-reset', `prev=${prevSize}, current=${currentSize}`);
       return;
     }
 
@@ -1034,9 +1489,13 @@
       if (!previousNeedAckAlertIds.has(id)) newIds.push(id);
     }
     previousNeedAckAlertIds = currentIds;
+    previousNeedAckSnapshotSize = currentSize;
     persistNeedAckSoundBaselineToSession();
 
-    if (!newIds.length) return;
+    if (!newIds.length) {
+      reportDiagnostics('no-new-alerts', `ids=${currentIds.size}`);
+      return;
+    }
 
     let hasAlertChime = false;
     let hasSoft = false;
@@ -1049,6 +1508,7 @@
 
     if (hasAlertChime) playNeedAckChime('alert');
     else if (hasSoft) playNeedAckChime('soft');
+    reportDiagnostics('new-alerts', `new=${newIds.length}, total=${currentIds.size}`);
   }
 
   function loadState(callback) {
@@ -1058,7 +1518,7 @@
     }
 
     chrome.storage.local.get(
-      [STORAGE_KEY, AUTO_REFRESH_ENABLED_KEY, AUTO_REFRESH_IDLE_SECONDS_KEY, SOUND_ALERTS_ENABLED_KEY],
+      [STORAGE_KEY, AUTO_REFRESH_ENABLED_KEY, AUTO_REFRESH_IDLE_SECONDS_KEY, SOUND_ALERTS_ENABLED_KEY, DIAGNOSTICS_ENABLED_KEY],
       (result) => {
       showSilenced = Boolean(result[STORAGE_KEY]);
       autoRefreshEnabled = typeof result[AUTO_REFRESH_ENABLED_KEY] === 'boolean'
@@ -1068,6 +1528,12 @@
       soundAlertsEnabled = typeof result[SOUND_ALERTS_ENABLED_KEY] === 'boolean'
         ? result[SOUND_ALERTS_ENABLED_KEY]
         : true;
+      diagnosticsEnabled = typeof result[DIAGNOSTICS_ENABLED_KEY] === 'boolean'
+        ? result[DIAGNOSTICS_ENABLED_KEY]
+        : false;
+      if (!autoRefreshEnabled) {
+        scheduleAutoRefreshReEnable();
+      }
       callback();
       }
     );
@@ -1148,8 +1614,29 @@
     updateAutoRefreshCountdown();
   }
 
+  function clearAutoRefreshReEnableTimer() {
+    if (!autoRefreshReEnableTimer) return;
+    clearTimeout(autoRefreshReEnableTimer);
+    autoRefreshReEnableTimer = null;
+  }
+
+  function scheduleAutoRefreshReEnable() {
+    clearAutoRefreshReEnableTimer();
+    autoRefreshReEnableTimer = setTimeout(() => {
+      autoRefreshReEnableTimer = null;
+      if (autoRefreshEnabled) return;
+
+      autoRefreshEnabled = true;
+      markUserActivity();
+      saveAutoRefreshState();
+      updateAutoRefreshControls();
+    }, AUTO_REFRESH_FORCE_REENABLE_MS);
+  }
+
   function handleAutoRefreshToggleChange(e) {
     autoRefreshEnabled = Boolean(e.target.checked);
+    if (autoRefreshEnabled) clearAutoRefreshReEnableTimer();
+    else scheduleAutoRefreshReEnable();
     markUserActivity();
     saveAutoRefreshState();
     updateAutoRefreshControls();
@@ -1182,6 +1669,7 @@
     if (!autoRefreshEnabled) return;
 
     autoRefreshEnabled = false;
+    scheduleAutoRefreshReEnable();
     markUserActivity();
     saveAutoRefreshState();
     updateAutoRefreshControls();
@@ -1192,11 +1680,82 @@
     if (cb) cb.checked = soundAlertsEnabled;
   }
 
+  function updateDiagnosticsControl() {
+    const cb = document.getElementById(DIAGNOSTICS_TOGGLE_ID);
+    if (cb) cb.checked = diagnosticsEnabled;
+    const openBtn = document.getElementById(DIAGNOSTICS_OPEN_BUTTON_ID);
+    if (openBtn) {
+      openBtn.textContent = diagnosticsModalOpen ? 'Закрыть лог' : 'Открыть лог';
+    }
+  }
+
   function handleSoundAlertsToggle(e) {
     soundAlertsEnabled = Boolean(e.target.checked);
     saveSoundAlertsState();
     resetNeedAckSoundBaseline();
     updateSoundAlertsControl();
+  }
+
+  function handleSoundTestClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    markUserActivity();
+    reportDiagnostics('sound-test-click', `enabled=${soundAlertsEnabled ? 'on' : 'off'}`);
+    playNeedAckChime('alert');
+  }
+
+  function handleDiagnosticsToggle(e) {
+    diagnosticsEnabled = Boolean(e.target.checked);
+    saveDiagnosticsState();
+    updateDiagnosticsControl();
+    reportDiagnostics('diag-toggled', diagnosticsEnabled ? 'on' : 'off');
+  }
+
+  function handleDiagnosticsOpenClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDiagnosticsModalOpen(!diagnosticsModalOpen);
+    updateDiagnosticsControl();
+  }
+
+  function ensureDiagnosticsModal() {
+    let modal = document.getElementById(DIAGNOSTICS_MODAL_ID);
+    if (modal) return modal;
+
+    modal = document.createElement('div');
+    modal.id = DIAGNOSTICS_MODAL_ID;
+    modal.innerHTML = `
+      <div class="bosun-diagnostics-modal-card" role="dialog" aria-modal="true" aria-label="Diagnostics log">
+        <div class="bosun-diagnostics-modal-head">
+          <strong>Bosun Diagnostics Log</strong>
+          <div class="bosun-diagnostics-modal-actions">
+            <button type="button" data-role="clear">Очистить</button>
+            <button type="button" data-role="close">Закрыть</button>
+          </div>
+        </div>
+        <div class="bosun-diagnostics-modal-body">
+          <ul id="${DIAGNOSTICS_LOG_LIST_ID}"></ul>
+        </div>
+      </div>
+    `;
+
+    modal.addEventListener('click', (event) => {
+      const role = event.target?.getAttribute?.('data-role');
+      if (event.target === modal || role === 'close') {
+        setDiagnosticsModalOpen(false);
+        updateDiagnosticsControl();
+        return;
+      }
+      if (role === 'clear') {
+        diagnosticsLogEntries = [];
+        saveDiagnosticsLogToStorage();
+        renderDiagnosticsLogList();
+      }
+    });
+
+    document.body.appendChild(modal);
+    renderDiagnosticsLogList();
+    return modal;
   }
 
   function ensureSoundAlertsControls(actions) {
@@ -1212,7 +1771,55 @@
       wrap.appendChild(document.createTextNode('Звуковое оповещение'));
       actions.appendChild(wrap);
     }
+
     updateSoundAlertsControl();
+  }
+
+  function ensureDiagnosticsControls(actions) {
+    let group = actions.querySelector('.bosun-diagnostics-group');
+    if (!group) {
+      group = document.createElement('div');
+      group.className = 'bosun-diagnostics-group';
+      actions.appendChild(group);
+    }
+
+    let wrap = group.querySelector('.bosun-diagnostics-wrap');
+    if (!wrap) {
+      wrap = document.createElement('label');
+      wrap.className = 'bosun-auto-refresh-label bosun-diagnostics-wrap';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = DIAGNOSTICS_TOGGLE_ID;
+      cb.addEventListener('change', handleDiagnosticsToggle);
+      wrap.appendChild(cb);
+      wrap.appendChild(document.createTextNode('Диагностика'));
+      group.appendChild(wrap);
+    }
+    let openBtn = group.querySelector(`#${DIAGNOSTICS_OPEN_BUTTON_ID}`);
+    if (!openBtn) {
+      openBtn = document.createElement('button');
+      openBtn.type = 'button';
+      openBtn.id = DIAGNOSTICS_OPEN_BUTTON_ID;
+      openBtn.textContent = 'Открыть лог';
+      openBtn.title = 'Открыть окно журнала диагностики';
+      openBtn.addEventListener('click', handleDiagnosticsOpenClick);
+      group.appendChild(openBtn);
+    }
+    let testBtn = document.getElementById(SOUND_TEST_BUTTON_ID);
+    if (!testBtn) {
+      testBtn = document.createElement('button');
+      testBtn.type = 'button';
+      testBtn.id = SOUND_TEST_BUTTON_ID;
+      testBtn.textContent = 'Тест звука';
+      testBtn.title = 'Проиграть тестовый alert sound';
+      testBtn.addEventListener('click', handleSoundTestClick);
+    }
+    // Keep sound test button immediately to the right of "Открыть лог".
+    if (openBtn.nextSibling !== testBtn || testBtn.parentElement !== group) {
+      group.insertBefore(testBtn, openBtn.nextSibling);
+    }
+    ensureDiagnosticsModal();
+    updateDiagnosticsControl();
   }
 
   function ensureAutoRefreshControls(actions) {
@@ -1407,6 +2014,7 @@
     if (counter.parentElement !== actions) {
       actions.appendChild(counter);
     }
+    ensureDiagnosticsControls(actions);
     updateToggleText();
   }
 
@@ -1487,6 +2095,94 @@
     return subjectNode?.textContent?.replace(/\s+/g, ' ').trim() || null;
   }
 
+  function buildChildMarkerKey(id, groupSubject, childSubject, ago) {
+    const normalizedId = id != null && String(id).trim() ? String(id).trim() : '';
+    if (normalizedId) return `id:${normalizedId}`;
+
+    const g = typeof groupSubject === 'string' ? groupSubject.trim() : '';
+    const c = typeof childSubject === 'string' ? childSubject.trim() : '';
+    const a = typeof ago === 'string' ? ago.trim() : '';
+
+    if (g && c && a) return `g:${g}|c:${c}|ago:${a}`;
+    if (g && c) return `g:${g}|c:${c}`;
+    if (c && a) return `c:${c}|ago:${a}`;
+    if (c) return `c:${c}`;
+    if (g) return `g:${g}`;
+    return null;
+  }
+
+  function getPanelAgoFromHeading(heading) {
+    const ageNode = heading?.querySelector('[ts-since="child.Ago"], .pull-right[ts-since]');
+    return ageNode?.textContent?.replace(/\s+/g, ' ').trim() || null;
+  }
+
+  function buildChildMarkerKeyFromData(child, group) {
+    return buildChildMarkerKey(
+      child?.State?.Id,
+      typeof group?.Subject === 'string' ? group.Subject : '',
+      (typeof child?.Subject === 'string' && child.Subject.trim())
+        ? child.Subject
+        : (typeof child?.AlertKey === 'string' ? child.AlertKey : ''),
+      typeof child?.Ago === 'string' ? child.Ago : ''
+    );
+  }
+
+  function buildChildMarkerKeyFromHeading(heading, groupPanel) {
+    if (!heading) return null;
+    const panelId = getPanelIdFromHeading(heading);
+    const groupSubject = getGroupSubjectFromPanel(groupPanel);
+    const subject = getPanelSubjectFromHeading(heading);
+    const ago = getPanelAgoFromHeading(heading);
+    return buildChildMarkerKey(panelId, groupSubject, subject, ago);
+  }
+
+  function getGroupChildPanels(groupPanel) {
+    if (!groupPanel) return [];
+    return Array.from(groupPanel.querySelectorAll('[ng-repeat="child in group.Children"]'))
+      .map((node) => node.closest('.panel') || node)
+      .filter(Boolean);
+  }
+
+  function buildGroupMarkerKey(groupSubject, childKeys) {
+    const g = typeof groupSubject === 'string' ? groupSubject.trim() : '';
+    const normalizedChildKeys = Array.isArray(childKeys)
+      ? childKeys.filter((key) => typeof key === 'string' && key)
+      : [];
+
+    if (g && normalizedChildKeys.length) {
+      return `group:${g}|children:${normalizedChildKeys.slice().sort().join(',')}`;
+    }
+    if (g) return `group:${g}`;
+    if (normalizedChildKeys.length) return `children:${normalizedChildKeys.slice().sort().join(',')}`;
+    return null;
+  }
+
+  function buildGroupMarkerKeyFromData(group) {
+    const groupSubject = typeof group?.Subject === 'string' ? group.Subject : '';
+    const children = Array.isArray(group?.Children) ? group.Children : [];
+    const childKeys = children
+      .map((child) => buildChildMarkerKeyFromData(child, group))
+      .filter((key) => typeof key === 'string' && key);
+    return buildGroupMarkerKey(groupSubject, childKeys);
+  }
+
+  function buildGroupMarkerKeyFromDom(groupPanel) {
+    const groupSubject = getGroupSubjectFromPanel(groupPanel) || '';
+    const childKeys = getGroupChildPanels(groupPanel)
+      .map((childPanel) => buildChildMarkerKeyFromHeading(getChildHeading(childPanel), groupPanel))
+      .filter((key) => typeof key === 'string' && key);
+    return buildGroupMarkerKey(groupSubject, childKeys);
+  }
+
+  function findParentGroupPanelForChild(childPanel) {
+    if (!childPanel) return null;
+    const groups = getGroupPanels();
+    for (const groupPanel of groups) {
+      if (groupPanel.contains(childPanel)) return groupPanel;
+    }
+    return null;
+  }
+
   function hasNoteFromActions(actions) {
     if (!Array.isArray(actions)) return false;
 
@@ -1508,9 +2204,11 @@
 
   function rebuildAlertDataIndex(payload) {
     childOldNoNoteById.clear();
-    childOldNoNoteBySubject.clear();
+    childOldNoNoteByKey.clear();
     childHasNoteById.clear();
-    childHasNoteBySubject.clear();
+    childHasNoteByKey.clear();
+    groupHasOldNoNoteByKey.clear();
+    groupHasAnyNoteByKey.clear();
     groupHasOldNoNoteBySubject.clear();
     groupHasAnyNoteBySubject.clear();
 
@@ -1518,17 +2216,13 @@
     if (!Array.isArray(groups)) return;
 
     for (const group of groups) {
-      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
       let groupHasOldNoNote = false;
       let groupHasAnyNote = false;
 
       const children = Array.isArray(group?.Children) ? group.Children : [];
       for (const child of children) {
         const childId = child?.State?.Id != null ? String(child.State.Id) : null;
-        const childSubject =
-          typeof child?.Subject === 'string' && child.Subject.trim()
-            ? child.Subject.trim()
-            : (typeof child?.AlertKey === 'string' ? child.AlertKey.trim() : null);
+        const childKey = buildChildMarkerKeyFromData(child, group);
 
         const oldEnough = isOlderThanThreshold(child?.Ago);
         const hasNote = hasNoteFromActions(child?.State?.Actions);
@@ -1538,24 +2232,33 @@
           childOldNoNoteById.set(childId, oldNoNote);
           childHasNoteById.set(childId, hasNote);
         }
-        if (childSubject) {
-          childOldNoNoteBySubject.set(childSubject, oldNoNote);
-          childHasNoteBySubject.set(childSubject, hasNote);
+        if (childKey) {
+          childOldNoNoteByKey.set(childKey, oldNoNote);
+          childHasNoteByKey.set(childKey, hasNote);
         }
 
         if (oldNoNote) groupHasOldNoNote = true;
         if (hasNote) groupHasAnyNote = true;
       }
 
-      if (groupSubject) {
-        const prevOld = groupHasOldNoNoteBySubject.get(groupSubject) === true;
-        const prevNote = groupHasAnyNoteBySubject.get(groupSubject) === true;
+      const groupKey = buildGroupMarkerKeyFromData(group);
+      if (groupKey) {
+        const prevOld = groupHasOldNoNoteByKey.get(groupKey) === true;
+        const prevNote = groupHasAnyNoteByKey.get(groupKey) === true;
 
-        groupHasOldNoNoteBySubject.set(
-          groupSubject,
+        groupHasOldNoNoteByKey.set(
+          groupKey,
           prevOld || groupHasOldNoNote
         );
-        groupHasAnyNoteBySubject.set(groupSubject, prevNote || groupHasAnyNote);
+        groupHasAnyNoteByKey.set(groupKey, prevNote || groupHasAnyNote);
+      }
+
+      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
+      if (groupSubject) {
+        const prevOldBySubject = groupHasOldNoNoteBySubject.get(groupSubject) === true;
+        const prevNoteBySubject = groupHasAnyNoteBySubject.get(groupSubject) === true;
+        groupHasOldNoNoteBySubject.set(groupSubject, prevOldBySubject || groupHasOldNoNote);
+        groupHasAnyNoteBySubject.set(groupSubject, prevNoteBySubject || groupHasAnyNote);
       }
     }
   }
@@ -1653,12 +2356,13 @@
     if (noteIcon) noteIcon.remove();
   }
 
-  function resolveChildState(panel) {
+  function resolveChildState(panel, parentGroupPanel = null) {
     const heading = getChildHeading(panel);
     if (!heading) return 'none';
 
     const panelId = getPanelIdFromHeading(heading);
-    const subject = getPanelSubjectFromHeading(heading);
+    const groupPanel = parentGroupPanel || findParentGroupPanelForChild(panel);
+    const childKey = buildChildMarkerKeyFromHeading(heading, groupPanel);
 
     let oldNoNote = false;
     let hasNote = false;
@@ -1668,9 +2372,9 @@
       if (childHasNoteById.has(panelId)) hasNote = childHasNoteById.get(panelId) === true;
     }
 
-    if (!oldNoNote && !hasNote && subject) {
-      if (childOldNoNoteBySubject.has(subject)) oldNoNote = childOldNoNoteBySubject.get(subject) === true;
-      if (childHasNoteBySubject.has(subject)) hasNote = childHasNoteBySubject.get(subject) === true;
+    if (!oldNoNote && !hasNote && childKey) {
+      if (childOldNoNoteByKey.has(childKey)) oldNoNote = childOldNoNoteByKey.get(childKey) === true;
+      if (childHasNoteByKey.has(childKey)) hasNote = childHasNoteByKey.get(childKey) === true;
     }
 
     if (oldNoNote) return 'warning';
@@ -1681,17 +2385,13 @@
   function resolveGroupStateFromDom(groupPanel) {
     if (!groupPanel) return 'none';
 
-    const childPanels = Array.from(
-      groupPanel.querySelectorAll('[ng-repeat="child in group.Children"]')
-    )
-      .map((node) => node.closest('.panel') || node)
-      .filter(Boolean);
+    const childPanels = getGroupChildPanels(groupPanel);
 
     let hasWarning = false;
     let hasNote = false;
 
     for (const childPanel of childPanels) {
-      const state = resolveChildState(childPanel);
+      const state = resolveChildState(childPanel, groupPanel);
       if (state === 'warning') hasWarning = true;
       else if (state === 'note') hasNote = true;
     }
@@ -1709,31 +2409,40 @@
   }
 
   function resolveGroupState(groupPanel) {
-    const subject = getGroupSubjectFromPanel(groupPanel);
+    const groupKey = buildGroupMarkerKeyFromDom(groupPanel);
+    const groupSubject = getGroupSubjectFromPanel(groupPanel);
 
     const domState = resolveGroupStateFromDom(groupPanel);
     if (domState !== 'none') {
-      if (subject) lastResolvedParentStateBySubject.set(subject, domState);
+      if (groupKey) lastResolvedParentStateByKey.set(groupKey, domState);
       return domState;
     }
 
-    if (subject) {
-      const hasOldNoNote = groupHasOldNoNoteBySubject.get(subject) === true;
-      const hasAnyNote = groupHasAnyNoteBySubject.get(subject) === true;
+    if (groupKey) {
+      const hasOldNoNote = groupHasOldNoNoteByKey.get(groupKey) === true;
+      const hasAnyNote = groupHasAnyNoteByKey.get(groupKey) === true;
 
       if (hasOldNoNote) {
-        lastResolvedParentStateBySubject.set(subject, 'warning');
+        lastResolvedParentStateByKey.set(groupKey, 'warning');
         return 'warning';
       }
       if (hasAnyNote) {
-        lastResolvedParentStateBySubject.set(subject, 'note');
+        lastResolvedParentStateByKey.set(groupKey, 'note');
         return 'note';
       }
 
-      const stickyState = lastResolvedParentStateBySubject.get(subject);
+      const stickyState = lastResolvedParentStateByKey.get(groupKey);
       if (stickyState === 'warning' || stickyState === 'note') {
         return stickyState;
       }
+    }
+
+    if (groupSubject) {
+      const hasOldNoNoteBySubject = groupHasOldNoNoteBySubject.get(groupSubject) === true;
+      const hasAnyNoteBySubject = groupHasAnyNoteBySubject.get(groupSubject) === true;
+
+      if (hasOldNoNoteBySubject) return 'warning';
+      if (hasAnyNoteBySubject) return 'note';
     }
 
     const existingState = getExistingParentMarkerState(groupPanel);
@@ -1845,8 +2554,10 @@
       ensureCopyButtons();
       markNoSelectElements();
       refreshSilencedBadges();
+      reportDiagnostics('refresh-ok', 'alerts payload received');
     } catch (err) {
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
+      reportDiagnostics('refresh-failed', err?.message || 'unknown-error');
     } finally {
       dataRefreshInFlight = false;
 
@@ -1871,6 +2582,20 @@
     if (observerStarted || !document.body) return;
     observerStarted = true;
 
+    function isNeedsAckNode(node, needsAckRoot) {
+      if (!node || node.nodeType !== 1) return false;
+
+      if (needsAckRoot && (node === needsAckRoot || needsAckRoot.contains(node))) {
+        return true;
+      }
+
+      if (node.matches?.('[ts-ack-group="schedule.Groups.NeedAck"]')) {
+        return true;
+      }
+
+      return !!node.querySelector?.('[ts-ack-group="schedule.Groups.NeedAck"]');
+    }
+
     const observer = new MutationObserver((mutations) => {
       let shouldRefreshUi = false;
       let shouldRefreshData = false;
@@ -1889,8 +2614,19 @@
 
         shouldRefreshUi = true;
 
-        if (needsAckRoot && (needsAckRoot.contains(target) || target === needsAckRoot)) {
+        if (isNeedsAckNode(target, needsAckRoot)) {
           shouldRefreshData = true;
+          continue;
+        }
+
+        if (mutation.type === 'childList') {
+          const addedNodes = mutation.addedNodes ? Array.from(mutation.addedNodes) : [];
+          const removedNodes = mutation.removedNodes ? Array.from(mutation.removedNodes) : [];
+          const changedNodes = [...addedNodes, ...removedNodes];
+
+          if (changedNodes.some((node) => isNeedsAckNode(node, needsAckRoot))) {
+            shouldRefreshData = true;
+          }
         }
       }
 
@@ -1912,9 +2648,12 @@
   }
 
   function init() {
+    restoreDiagnosticsLogFromStorage();
     injectStyles();
     installSelectionGuard();
     installUserActivityTracking();
+    installAudioUnlockTracking();
+    ensureAudioObjects();
     scheduleTopBarMount();
     restoreNeedAckSoundBaselineFromSession();
 
