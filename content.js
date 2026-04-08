@@ -13,6 +13,7 @@
   const AUTO_REFRESH_COUNTDOWN_ID = 'bosun-auto-refresh-countdown';
   const SOUND_ALERTS_ENABLED_KEY = 'bosunSoundAlertsEnabled';
   const SOUND_ALERTS_TOGGLE_ID = 'bosun-sound-alerts-toggle';
+  const NEED_ACK_SOUND_BASELINE_SESSION_KEY = 'bosunNeedAckSoundBaselineV1';
   const SOUND_FILE_ALERT = 'bosun_notification_alert_chime.wav';
   const SOUND_FILE_SOFT = 'bosun_notification_soft_chime.wav';
   const COPY_BUTTON_CLASS = 'bosun-copy-alert-btn';
@@ -863,6 +864,40 @@
   function resetNeedAckSoundBaseline() {
     needAckSoundBaselineReady = false;
     previousNeedAckAlertIds = new Set();
+    clearNeedAckSoundBaselineSession();
+  }
+
+  function persistNeedAckSoundBaselineToSession() {
+    if (!window?.sessionStorage) return;
+    try {
+      const payload = {
+        ready: needAckSoundBaselineReady,
+        ids: Array.from(previousNeedAckAlertIds)
+      };
+      window.sessionStorage.setItem(
+        NEED_ACK_SOUND_BASELINE_SESSION_KEY,
+        JSON.stringify(payload)
+      );
+    } catch (_) {}
+  }
+
+  function restoreNeedAckSoundBaselineFromSession() {
+    if (!window?.sessionStorage) return;
+    try {
+      const raw = window.sessionStorage.getItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.ready !== true || !Array.isArray(parsed.ids)) return;
+      previousNeedAckAlertIds = new Set(parsed.ids.filter((id) => typeof id === 'string' && id));
+      needAckSoundBaselineReady = true;
+    } catch (_) {}
+  }
+
+  function clearNeedAckSoundBaselineSession() {
+    if (!window?.sessionStorage) return;
+    try {
+      window.sessionStorage.removeItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
+    } catch (_) {}
   }
 
   function normalizeNeedAckChildren(raw) {
@@ -990,6 +1025,7 @@
     if (!needAckSoundBaselineReady) {
       previousNeedAckAlertIds = currentIds;
       needAckSoundBaselineReady = true;
+      persistNeedAckSoundBaselineToSession();
       return;
     }
 
@@ -998,6 +1034,7 @@
       if (!previousNeedAckAlertIds.has(id)) newIds.push(id);
     }
     previousNeedAckAlertIds = currentIds;
+    persistNeedAckSoundBaselineToSession();
 
     if (!newIds.length) return;
 
@@ -1879,6 +1916,7 @@
     installSelectionGuard();
     installUserActivityTracking();
     scheduleTopBarMount();
+    restoreNeedAckSoundBaselineFromSession();
 
     loadState(() => {
       markUserActivity();
