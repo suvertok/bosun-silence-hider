@@ -13,6 +13,13 @@
   const AUTO_REFRESH_COUNTDOWN_ID = 'bosun-auto-refresh-countdown';
   const SOUND_ALERTS_ENABLED_KEY = 'bosunSoundAlertsEnabled';
   const SOUND_ALERTS_TOGGLE_ID = 'bosun-sound-alerts-toggle';
+  const SOUND_TEST_BUTTON_ID = 'bosun-sound-test-button';
+  const DIAGNOSTICS_ENABLED_KEY = 'bosunDiagnosticsEnabled';
+  const DIAGNOSTICS_TOGGLE_ID = 'bosun-diagnostics-toggle';
+  const DIAGNOSTICS_OPEN_BUTTON_ID = 'bosun-diagnostics-open-button';
+  const DIAGNOSTICS_MODAL_ID = 'bosun-diagnostics-modal';
+  const DIAGNOSTICS_LOG_LIST_ID = 'bosun-diagnostics-log-list';
+  const DIAGNOSTICS_LOG_STORAGE_KEY = 'bosunDiagnosticsLogV1';
   const NEED_ACK_SOUND_BASELINE_SESSION_KEY = 'bosunNeedAckSoundBaselineV1';
   const SOUND_FILE_ALERT = 'bosun_notification_alert_chime.wav';
   const SOUND_FILE_SOFT = 'bosun_notification_soft_chime.wav';
@@ -20,6 +27,19 @@
   const COPY_ALL_BUTTON_CLASS = 'bosun-copy-all-alerts-btn';
   const NO_SELECT_CLASS = 'bosun-no-select';
   const SILENCED_BADGE_CLASS = 'bosun-silenced-badge';
+
+  /**
+   * Показывать ли в тулбаре блок «Диагностика» (чекбокс, кнопки «Открыть лог» / модалка журнала).
+   * Сейчас выключено: в обычной работе UI отладки не нужен.
+   *
+   * Как включить снова:
+   * — поставьте значение true ниже;
+   * — перезагрузите расширение в chrome://extensions (кнопка «Обновить» у пакета).
+   *
+   * Запись в chrome.storage и внутренний diagnosticsApi при этом остаются; при скрытом UI
+   * переключатель недоступен, но флаг из storage всё ещё читается при старте.
+   */
+  const DIAGNOSTICS_TOOLBAR_UI_ENABLED = false;
 
   let bosunSelectionDragState = null;
 
@@ -32,6 +52,7 @@
   const AUTO_REFRESH_DEFAULT_IDLE_SECONDS = 60;
   const AUTO_REFRESH_MIN_IDLE_SECONDS = 10;
   const AUTO_REFRESH_MAX_IDLE_SECONDS = 3600;
+  const AUTO_REFRESH_FORCE_REENABLE_MS = 10 * 60 * 1000;
 
   let showSilenced = false;
   let refreshTimer = null;
@@ -45,24 +66,76 @@
   let autoRefreshEnabled = true;
   let autoRefreshIdleSeconds = AUTO_REFRESH_DEFAULT_IDLE_SECONDS;
   let autoRefreshTimer = null;
+  let autoRefreshReEnableTimer = null;
   let lastUserActivityTs = Date.now();
   let lastKnownUrl = window.location.href;
   let topBarMountObserver = null;
   let soundAlertsEnabled = true;
-  let needAckSoundBaselineReady = false;
-  let previousNeedAckAlertIds = new Set();
-  let lastNeedAckChimeAt = 0;
+  let diagnosticsEnabled = false;
+  const DIAGNOSTICS_LOG_MAX_ENTRIES = 750;
 
   // child maps
   const childOldNoNoteById = new Map();
-  const childOldNoNoteBySubject = new Map();
+  const childOldNoNoteByKey = new Map();
   const childHasNoteById = new Map();
-  const childHasNoteBySubject = new Map();
+  const childHasNoteByKey = new Map();
 
   // group maps
+  const groupHasOldNoNoteByKey = new Map();
+  const groupHasAnyNoteByKey = new Map();
   const groupHasOldNoNoteBySubject = new Map();
   const groupHasAnyNoteBySubject = new Map();
-  const lastResolvedParentStateBySubject = new Map();
+  const lastResolvedParentStateByKey = new Map();
+  const sharedUtils = globalThis.BosunSilenceHiderSharedUtils || null;
+  const diagnosticsApi = globalThis.BosunSilenceHiderDiagnostics?.createDiagnostics?.({
+    modalId: DIAGNOSTICS_MODAL_ID,
+    logListId: DIAGNOSTICS_LOG_LIST_ID,
+    logStorageKey: DIAGNOSTICS_LOG_STORAGE_KEY,
+    maxEntries: DIAGNOSTICS_LOG_MAX_ENTRIES,
+    getEnabled: () => diagnosticsEnabled
+  }) || null;
+  const soundApi = globalThis.BosunSilenceHiderSound?.createSound?.({
+    alertFile: SOUND_FILE_ALERT,
+    softFile: SOUND_FILE_SOFT,
+    getEnabled: () => soundAlertsEnabled,
+    reportDiagnostics: (eventName, details = '') => reportDiagnostics(eventName, details)
+  }) || null;
+  const alertsDataApi = globalThis.BosunSilenceHiderAlertsData?.createAlertsData?.({
+    oldNoNoteMinutes: OLD_NO_NOTE_MINUTES
+  }) || null;
+  const needAckSeverityApi = globalThis.BosunSilenceHiderNeedAckSeverity?.createNeedAckSeverity?.({
+    normalizeNeedAckChildren: (raw) => {
+      if (sharedUtils?.normalizeNeedAckChildren) {
+        return sharedUtils.normalizeNeedAckChildren(raw);
+      }
+      if (raw == null) return [];
+      if (Array.isArray(raw)) return raw;
+      return [raw];
+    }
+  }) || null;
+  const needAckBaselineApi = globalThis.BosunSilenceHiderNeedAckBaseline?.createNeedAckBaseline?.({
+    sessionKey: NEED_ACK_SOUND_BASELINE_SESSION_KEY,
+    isSoundEnabled: () => soundAlertsEnabled,
+    reportDiagnostics: (eventName, details = '') => reportDiagnostics(eventName, details),
+    playNeedAckChime: (kind) => soundApi?.playNeedAckChime?.(kind),
+    collectCurrentIdsAndSeverity: (payload) =>
+      needAckSeverityApi?.collectCurrentIdsAndSeverity?.(payload) ?? {
+        currentIds: new Set(),
+        idToSeverity: new Map()
+      }
+  }) || null;
+
+  if (!soundApi || !needAckBaselineApi || !needAckSeverityApi || !alertsDataApi) {
+    console.warn(
+      '[Bosun plugin] One or more extension modules failed to load; sound, NeedAck baseline, severity, or alerts index may be disabled.',
+      {
+        soundApi: Boolean(soundApi),
+        needAckBaselineApi: Boolean(needAckBaselineApi),
+        needAckSeverityApi: Boolean(needAckSeverityApi),
+        alertsDataApi: Boolean(alertsDataApi)
+      }
+    );
+  }
 
   function isActionPage() {
     return window.location.pathname === '/action';
@@ -344,10 +417,25 @@
         flex-wrap: wrap;
       }
 
+      #${TOP_BAR_ID} .bosun-diagnostics-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-left: auto;
+        padding-left: 10px;
+        border-left: 1px solid #d8d8d8;
+      }
+
       #${TOP_BAR_ID} .bosun-auto-refresh-group {
         display: inline-flex;
         align-items: center;
         gap: 8px;
+        margin-left: 4px;
+        margin-right: 8px;
+        padding-left: 12px;
+        padding-right: 12px;
+        border-left: 1px solid rgba(0, 0, 0, 0.12);
+        border-right: 1px solid rgba(0, 0, 0, 0.18);
       }
 
       #${TOP_BAR_ID} .bosun-auto-refresh-label {
@@ -372,6 +460,133 @@
         height: 14px;
         margin: 0;
         vertical-align: middle;
+      }
+
+      #${SOUND_TEST_BUTTON_ID} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 30px;
+        padding: 4px 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        line-height: 1.2;
+        cursor: pointer;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+      }
+
+      #${SOUND_TEST_BUTTON_ID}:hover {
+        background: #f5f5f5;
+        border-color: #adadad;
+      }
+
+      #${DIAGNOSTICS_TOGGLE_ID} {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        vertical-align: middle;
+      }
+
+      #${DIAGNOSTICS_OPEN_BUTTON_ID} {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        padding: 4px 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        line-height: 1.2;
+        cursor: pointer;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+      }
+
+      #${DIAGNOSTICS_OPEN_BUTTON_ID}:hover {
+        background: #f5f5f5;
+        border-color: #adadad;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.45);
+      }
+
+      #${DIAGNOSTICS_MODAL_ID}.is-open {
+        display: flex;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-card {
+        width: min(920px, calc(100vw - 32px));
+        max-height: calc(100vh - 48px);
+        display: flex;
+        flex-direction: column;
+        border-radius: 8px;
+        border: 1px solid #d6d6d6;
+        background: #fff;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 10px 12px;
+        border-bottom: 1px solid #ececec;
+        font-size: 13px;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-actions {
+        display: inline-flex;
+        gap: 8px;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-actions button {
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        color: #333;
+        font-size: 12px;
+        padding: 3px 10px;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-actions button:hover {
+        background: #f5f5f5;
+        border-color: #adadad;
+      }
+
+      #${DIAGNOSTICS_MODAL_ID} .bosun-diagnostics-modal-body {
+        padding: 0;
+        overflow: auto;
+      }
+
+      #${DIAGNOSTICS_LOG_LIST_ID} {
+        margin: 0;
+        padding: 8px 10px;
+        list-style: none;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      #${DIAGNOSTICS_LOG_LIST_ID} li {
+        padding: 4px 6px;
+        border-radius: 4px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      #${DIAGNOSTICS_LOG_LIST_ID} li:nth-child(odd) {
+        background: #fafafa;
       }
 
       #${TOP_BAR_ID} .bosun-auto-refresh-seconds {
@@ -839,13 +1054,33 @@
   }
 
   function normalizeAutoRefreshIdleSeconds(value) {
+    if (sharedUtils?.normalizeAutoRefreshIdleSeconds) {
+      return sharedUtils.normalizeAutoRefreshIdleSeconds(value, {
+        min: AUTO_REFRESH_MIN_IDLE_SECONDS,
+        max: AUTO_REFRESH_MAX_IDLE_SECONDS,
+        fallback: AUTO_REFRESH_DEFAULT_IDLE_SECONDS
+      });
+    }
     const numericValue = Number(value);
     if (!Number.isFinite(numericValue)) return AUTO_REFRESH_DEFAULT_IDLE_SECONDS;
-
     return Math.min(
       AUTO_REFRESH_MAX_IDLE_SECONDS,
       Math.max(AUTO_REFRESH_MIN_IDLE_SECONDS, Math.round(numericValue))
     );
+  }
+
+  function uniqueNodes(nodes) {
+    if (sharedUtils?.uniqueNodes) {
+      return sharedUtils.uniqueNodes(nodes);
+    }
+    const seen = new Set();
+    const result = [];
+    for (const node of nodes) {
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      result.push(node);
+    }
+    return result;
   }
 
   function saveAutoRefreshState() {
@@ -861,194 +1096,47 @@
     chrome.storage.local.set({ [SOUND_ALERTS_ENABLED_KEY]: soundAlertsEnabled });
   }
 
-  function resetNeedAckSoundBaseline() {
-    needAckSoundBaselineReady = false;
-    previousNeedAckAlertIds = new Set();
-    clearNeedAckSoundBaselineSession();
+  function saveDiagnosticsState() {
+    if (!chrome?.storage?.local) return;
+    chrome.storage.local.set({ [DIAGNOSTICS_ENABLED_KEY]: diagnosticsEnabled });
   }
 
-  function persistNeedAckSoundBaselineToSession() {
-    if (!window?.sessionStorage) return;
-    try {
-      const payload = {
-        ready: needAckSoundBaselineReady,
-        ids: Array.from(previousNeedAckAlertIds)
-      };
-      window.sessionStorage.setItem(
-        NEED_ACK_SOUND_BASELINE_SESSION_KEY,
-        JSON.stringify(payload)
-      );
-    } catch (_) {}
+  function resetNeedAckSoundBaseline() {
+    needAckBaselineApi?.reset?.();
   }
 
   function restoreNeedAckSoundBaselineFromSession() {
-    if (!window?.sessionStorage) return;
-    try {
-      const raw = window.sessionStorage.getItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (!parsed || parsed.ready !== true || !Array.isArray(parsed.ids)) return;
-      previousNeedAckAlertIds = new Set(parsed.ids.filter((id) => typeof id === 'string' && id));
-      needAckSoundBaselineReady = true;
-    } catch (_) {}
+    needAckBaselineApi?.restoreFromSession?.();
   }
 
-  function clearNeedAckSoundBaselineSession() {
-    if (!window?.sessionStorage) return;
-    try {
-      window.sessionStorage.removeItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
-    } catch (_) {}
+  function restoreDiagnosticsLogFromStorage() {
+    diagnosticsApi?.restoreLogFromStorage?.();
   }
 
-  function normalizeNeedAckChildren(raw) {
-    if (raw == null) return [];
-    if (Array.isArray(raw)) return raw;
-    return [raw];
+  function setDiagnosticsModalOpen(isOpen) {
+    diagnosticsApi?.setModalOpen?.(isOpen);
+  }
+
+  function reportDiagnostics(eventName, details = '') {
+    diagnosticsApi?.report?.(eventName, details);
   }
 
   function parseNeedAckStatusToBucket(raw) {
-    const s = String(raw ?? '').toLowerCase().trim();
-    if (s === 'critical') return 'critical';
-    if (s === 'warning') return 'warning';
-    if (s === 'unknown') return 'unknown';
-    if (s === 'normal' || s === 'none' || !s) return 'unknown';
-    if (s.includes('crit')) return 'critical';
-    if (s.includes('warn')) return 'warning';
-    return 'unknown';
+    return needAckSeverityApi?.parseNeedAckStatusToBucket?.(raw) ?? 'unknown';
   }
 
   /** В шаблоне Bosun у группы есть CurrentStatus; у ребёнка — State.* и Events[].Status */
   function getNeedAckSeverityBucket(child, group) {
-    const state = child?.State || {};
-    const events = Array.isArray(state.Events) ? state.Events : [];
-    const lastEv = events.length ? events[events.length - 1] : null;
-    const fromChild =
-      state.CurrentStatus ??
-      state.WorstStatus ??
-      state.LastAbnormalStatus ??
-      lastEv?.Status ??
-      '';
-    let bucket = parseNeedAckStatusToBucket(fromChild);
-    if (bucket === 'unknown' && !String(fromChild).trim() && group) {
-      const fromGroup =
-        group.CurrentStatus ??
-        group.WorstStatus ??
-        group.Status ??
-        '';
-      bucket = parseNeedAckStatusToBucket(fromGroup);
-    }
-    return bucket;
+    return needAckSeverityApi?.getNeedAckSeverityBucket?.(child, group) ?? 'unknown';
   }
 
   function getNeedAckSeverityFromGroupOnly(group) {
-    const raw =
-      group?.CurrentStatus ??
-      group?.WorstStatus ??
-      group?.Status ??
-      '';
-    return parseNeedAckStatusToBucket(raw);
+    return needAckSeverityApi?.getNeedAckSeverityFromGroupOnly?.(group) ?? 'unknown';
   }
 
-  /** Стабильный ключ: Id из State, иначе Subject/AlertKey (как в UI «N alerts» в группе) */
+  /** Стабильный ключ: Id -> AlertKey+Tags -> group+child+ago -> fallback */
   function needAckStableKey(child, group) {
-    const state = child?.State;
-    const id = state?.Id;
-    if (id != null && String(id).trim() !== '') {
-      return `id:${String(id)}`;
-    }
-    const groupSub = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-    const sub =
-      (typeof child?.Subject === 'string' && child.Subject.trim()) ||
-      (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
-      '';
-    const alertKey =
-      (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
-      (state && typeof state.Alert === 'string' && state.Alert.trim()) ||
-      '';
-    const tags = state && typeof state.Tags === 'string' ? state.Tags.trim() : '';
-    if (groupSub && sub) return `k:${groupSub}|${sub}`;
-    if (groupSub && alertKey) return `k:${groupSub}|ak:${alertKey}`;
-    if (alertKey && tags) return `k:ak:${alertKey}|t:${tags}`;
-    if (sub) return `k:s:${sub}`;
-    if (groupSub) return `k:g:${groupSub}`;
-    return null;
-  }
-
-  function playNeedAckChime(kind) {
-    if (!soundAlertsEnabled || !chrome?.runtime?.getURL) return;
-
-    const now = Date.now();
-    if (now - lastNeedAckChimeAt < 450) return;
-    lastNeedAckChimeAt = now;
-
-    const file = kind === 'alert' ? SOUND_FILE_ALERT : SOUND_FILE_SOFT;
-    const audio = new Audio(chrome.runtime.getURL(file));
-    audio.volume = 0.85;
-    audio.play().catch(() => {});
-  }
-
-  function processNeedAckNewAlertSounds(payload) {
-    if (!soundAlertsEnabled) return;
-
-    const groups = payload?.Groups?.NeedAck;
-    if (!Array.isArray(groups)) return;
-
-    const currentIds = new Set();
-    const idToSeverity = new Map();
-
-    for (const group of groups) {
-      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-      const children = normalizeNeedAckChildren(group?.Children);
-
-      if (!children.length && groupSubject) {
-        const key = `grp:${groupSubject}`;
-        currentIds.add(key);
-        idToSeverity.set(key, getNeedAckSeverityFromGroupOnly(group));
-        continue;
-      }
-
-      let anyChildKey = false;
-      for (const child of children) {
-        const key = needAckStableKey(child, group);
-        if (!key) continue;
-        anyChildKey = true;
-        currentIds.add(key);
-        idToSeverity.set(key, getNeedAckSeverityBucket(child, group));
-      }
-      if (!anyChildKey && groupSubject) {
-        const key = `grp:${groupSubject}`;
-        currentIds.add(key);
-        idToSeverity.set(key, getNeedAckSeverityFromGroupOnly(group));
-      }
-    }
-
-    if (!needAckSoundBaselineReady) {
-      previousNeedAckAlertIds = currentIds;
-      needAckSoundBaselineReady = true;
-      persistNeedAckSoundBaselineToSession();
-      return;
-    }
-
-    const newIds = [];
-    for (const id of currentIds) {
-      if (!previousNeedAckAlertIds.has(id)) newIds.push(id);
-    }
-    previousNeedAckAlertIds = currentIds;
-    persistNeedAckSoundBaselineToSession();
-
-    if (!newIds.length) return;
-
-    let hasAlertChime = false;
-    let hasSoft = false;
-    for (const id of newIds) {
-      const bucket = idToSeverity.get(id) || 'unknown';
-      if (bucket === 'critical' || bucket === 'unknown') hasAlertChime = true;
-      else if (bucket === 'warning') hasSoft = true;
-      else hasSoft = true;
-    }
-
-    if (hasAlertChime) playNeedAckChime('alert');
-    else if (hasSoft) playNeedAckChime('soft');
+    return needAckSeverityApi?.needAckStableKey?.(child, group) ?? null;
   }
 
   function loadState(callback) {
@@ -1058,7 +1146,7 @@
     }
 
     chrome.storage.local.get(
-      [STORAGE_KEY, AUTO_REFRESH_ENABLED_KEY, AUTO_REFRESH_IDLE_SECONDS_KEY, SOUND_ALERTS_ENABLED_KEY],
+      [STORAGE_KEY, AUTO_REFRESH_ENABLED_KEY, AUTO_REFRESH_IDLE_SECONDS_KEY, SOUND_ALERTS_ENABLED_KEY, DIAGNOSTICS_ENABLED_KEY],
       (result) => {
       showSilenced = Boolean(result[STORAGE_KEY]);
       autoRefreshEnabled = typeof result[AUTO_REFRESH_ENABLED_KEY] === 'boolean'
@@ -1068,6 +1156,12 @@
       soundAlertsEnabled = typeof result[SOUND_ALERTS_ENABLED_KEY] === 'boolean'
         ? result[SOUND_ALERTS_ENABLED_KEY]
         : true;
+      diagnosticsEnabled = typeof result[DIAGNOSTICS_ENABLED_KEY] === 'boolean'
+        ? result[DIAGNOSTICS_ENABLED_KEY]
+        : false;
+      if (!autoRefreshEnabled) {
+        scheduleAutoRefreshReEnable();
+      }
       callback();
       }
     );
@@ -1148,8 +1242,29 @@
     updateAutoRefreshCountdown();
   }
 
+  function clearAutoRefreshReEnableTimer() {
+    if (!autoRefreshReEnableTimer) return;
+    clearTimeout(autoRefreshReEnableTimer);
+    autoRefreshReEnableTimer = null;
+  }
+
+  function scheduleAutoRefreshReEnable() {
+    clearAutoRefreshReEnableTimer();
+    autoRefreshReEnableTimer = setTimeout(() => {
+      autoRefreshReEnableTimer = null;
+      if (autoRefreshEnabled) return;
+
+      autoRefreshEnabled = true;
+      markUserActivity();
+      saveAutoRefreshState();
+      updateAutoRefreshControls();
+    }, AUTO_REFRESH_FORCE_REENABLE_MS);
+  }
+
   function handleAutoRefreshToggleChange(e) {
     autoRefreshEnabled = Boolean(e.target.checked);
+    if (autoRefreshEnabled) clearAutoRefreshReEnableTimer();
+    else scheduleAutoRefreshReEnable();
     markUserActivity();
     saveAutoRefreshState();
     updateAutoRefreshControls();
@@ -1182,6 +1297,7 @@
     if (!autoRefreshEnabled) return;
 
     autoRefreshEnabled = false;
+    scheduleAutoRefreshReEnable();
     markUserActivity();
     saveAutoRefreshState();
     updateAutoRefreshControls();
@@ -1192,11 +1308,48 @@
     if (cb) cb.checked = soundAlertsEnabled;
   }
 
+  function updateDiagnosticsControl() {
+    const cb = document.getElementById(DIAGNOSTICS_TOGGLE_ID);
+    if (cb) cb.checked = diagnosticsEnabled;
+    const openBtn = document.getElementById(DIAGNOSTICS_OPEN_BUTTON_ID);
+    if (openBtn) {
+      const isOpen = diagnosticsApi?.isModalOpen?.() === true;
+      openBtn.textContent = isOpen ? 'Закрыть лог' : 'Открыть лог';
+    }
+  }
+
   function handleSoundAlertsToggle(e) {
     soundAlertsEnabled = Boolean(e.target.checked);
     saveSoundAlertsState();
     resetNeedAckSoundBaseline();
     updateSoundAlertsControl();
+  }
+
+  function handleSoundTestClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    markUserActivity();
+    reportDiagnostics('sound-test-click', `enabled=${soundAlertsEnabled ? 'on' : 'off'}`);
+    soundApi?.playNeedAckChime?.('alert');
+  }
+
+  function handleDiagnosticsToggle(e) {
+    diagnosticsEnabled = Boolean(e.target.checked);
+    saveDiagnosticsState();
+    updateDiagnosticsControl();
+    reportDiagnostics('diag-toggled', diagnosticsEnabled ? 'on' : 'off');
+  }
+
+  function handleDiagnosticsOpenClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const isOpen = diagnosticsApi?.isModalOpen?.() === true;
+    setDiagnosticsModalOpen(!isOpen);
+    updateDiagnosticsControl();
+  }
+
+  function ensureDiagnosticsModal() {
+    return diagnosticsApi?.ensureModal?.(updateDiagnosticsControl) || null;
   }
 
   function ensureSoundAlertsControls(actions) {
@@ -1212,7 +1365,85 @@
       wrap.appendChild(document.createTextNode('Звуковое оповещение'));
       actions.appendChild(wrap);
     }
+
     updateSoundAlertsControl();
+  }
+
+  /** Кнопка «Тест звука» при выключенном блоке диагностики — сразу после «Звуковое оповещение». */
+  function ensureSoundTestButtonAfterSoundWrap(actions) {
+    let testBtn = document.getElementById(SOUND_TEST_BUTTON_ID);
+    if (!testBtn) {
+      testBtn = document.createElement('button');
+      testBtn.type = 'button';
+      testBtn.id = SOUND_TEST_BUTTON_ID;
+      testBtn.textContent = 'Тест';
+      testBtn.title = 'Проиграть тестовый alert sound';
+      testBtn.addEventListener('click', handleSoundTestClick);
+    }
+    const soundWrap = actions.querySelector('.bosun-sound-alerts-wrap');
+    if (soundWrap) {
+      if (soundWrap.nextElementSibling !== testBtn) {
+        soundWrap.insertAdjacentElement('afterend', testBtn);
+      }
+    } else if (testBtn.parentElement !== actions) {
+      actions.appendChild(testBtn);
+    }
+  }
+
+  function ensureDiagnosticsControls(actions) {
+    if (!DIAGNOSTICS_TOOLBAR_UI_ENABLED) {
+      const deadGroup = actions.querySelector('.bosun-diagnostics-group');
+      if (deadGroup) deadGroup.remove();
+      const deadModal = document.getElementById(DIAGNOSTICS_MODAL_ID);
+      if (deadModal) deadModal.remove();
+      ensureSoundTestButtonAfterSoundWrap(actions);
+      return;
+    }
+
+    let group = actions.querySelector('.bosun-diagnostics-group');
+    if (!group) {
+      group = document.createElement('div');
+      group.className = 'bosun-diagnostics-group';
+      actions.appendChild(group);
+    }
+
+    let wrap = group.querySelector('.bosun-diagnostics-wrap');
+    if (!wrap) {
+      wrap = document.createElement('label');
+      wrap.className = 'bosun-auto-refresh-label bosun-diagnostics-wrap';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = DIAGNOSTICS_TOGGLE_ID;
+      cb.addEventListener('change', handleDiagnosticsToggle);
+      wrap.appendChild(cb);
+      wrap.appendChild(document.createTextNode('Диагностика'));
+      group.appendChild(wrap);
+    }
+    let openBtn = group.querySelector(`#${DIAGNOSTICS_OPEN_BUTTON_ID}`);
+    if (!openBtn) {
+      openBtn = document.createElement('button');
+      openBtn.type = 'button';
+      openBtn.id = DIAGNOSTICS_OPEN_BUTTON_ID;
+      openBtn.textContent = 'Открыть лог';
+      openBtn.title = 'Открыть окно журнала диагностики';
+      openBtn.addEventListener('click', handleDiagnosticsOpenClick);
+      group.appendChild(openBtn);
+    }
+    let testBtn = document.getElementById(SOUND_TEST_BUTTON_ID);
+    if (!testBtn) {
+      testBtn = document.createElement('button');
+      testBtn.type = 'button';
+      testBtn.id = SOUND_TEST_BUTTON_ID;
+      testBtn.textContent = 'Тест звука';
+      testBtn.title = 'Проиграть тестовый alert sound';
+      testBtn.addEventListener('click', handleSoundTestClick);
+    }
+    // Keep sound test button immediately to the right of "Открыть лог".
+    if (openBtn.nextSibling !== testBtn || testBtn.parentElement !== group) {
+      group.insertBefore(testBtn, openBtn.nextSibling);
+    }
+    ensureDiagnosticsModal();
+    updateDiagnosticsControl();
   }
 
   function ensureAutoRefreshControls(actions) {
@@ -1407,24 +1638,12 @@
     if (counter.parentElement !== actions) {
       actions.appendChild(counter);
     }
+    ensureDiagnosticsControls(actions);
     updateToggleText();
   }
 
   function getNeedsAckRoot() {
     return document.querySelector('[ts-ack-group="schedule.Groups.NeedAck"]');
-  }
-
-  function uniqueNodes(nodes) {
-    const seen = new Set();
-    const result = [];
-
-    for (const node of nodes) {
-      if (!node || seen.has(node)) continue;
-      seen.add(node);
-      result.push(node);
-    }
-
-    return result;
   }
 
   function getGroupPanels() {
@@ -1487,77 +1706,124 @@
     return subjectNode?.textContent?.replace(/\s+/g, ' ').trim() || null;
   }
 
-  function hasNoteFromActions(actions) {
-    if (!Array.isArray(actions)) return false;
+  function buildChildMarkerKey(id, groupSubject, childSubject, ago) {
+    const normalizedId = id != null && String(id).trim() ? String(id).trim() : '';
+    if (normalizedId) return `id:${normalizedId}`;
 
-    return actions.some((action) => {
-      return action &&
-        action.Type === 'Note' &&
-        typeof action.Message === 'string' &&
-        action.Message.trim().length > 0 &&
-        action.Cancelled !== true;
-    });
+    const g = typeof groupSubject === 'string' ? groupSubject.trim() : '';
+    const c = typeof childSubject === 'string' ? childSubject.trim() : '';
+    const a = typeof ago === 'string' ? ago.trim() : '';
+
+    if (g && c && a) return `g:${g}|c:${c}|ago:${a}`;
+    if (g && c) return `g:${g}|c:${c}`;
+    if (c && a) return `c:${c}|ago:${a}`;
+    if (c) return `c:${c}`;
+    if (g) return `g:${g}`;
+    return null;
   }
 
-  function isOlderThanThreshold(agoValue) {
-    if (!agoValue) return false;
-    const ts = Date.parse(agoValue);
-    if (!Number.isFinite(ts)) return false;
-    return (Date.now() - ts) >= OLD_NO_NOTE_MINUTES * 60 * 1000;
+  function getPanelAgoFromHeading(heading) {
+    const ageNode = heading?.querySelector('[ts-since="child.Ago"], .pull-right[ts-since]');
+    return ageNode?.textContent?.replace(/\s+/g, ' ').trim() || null;
+  }
+
+  function buildChildMarkerKeyFromData(child, group) {
+    return buildChildMarkerKey(
+      child?.State?.Id,
+      typeof group?.Subject === 'string' ? group.Subject : '',
+      (typeof child?.Subject === 'string' && child.Subject.trim())
+        ? child.Subject
+        : (typeof child?.AlertKey === 'string' ? child.AlertKey : ''),
+      typeof child?.Ago === 'string' ? child.Ago : ''
+    );
+  }
+
+  function buildChildMarkerKeyFromHeading(heading, groupPanel) {
+    if (!heading) return null;
+    const panelId = getPanelIdFromHeading(heading);
+    const groupSubject = getGroupSubjectFromPanel(groupPanel);
+    const subject = getPanelSubjectFromHeading(heading);
+    const ago = getPanelAgoFromHeading(heading);
+    return buildChildMarkerKey(panelId, groupSubject, subject, ago);
+  }
+
+  function getGroupChildPanels(groupPanel) {
+    if (!groupPanel) return [];
+    return Array.from(groupPanel.querySelectorAll('[ng-repeat="child in group.Children"]'))
+      .map((node) => node.closest('.panel') || node)
+      .filter(Boolean);
+  }
+
+  function buildGroupMarkerKey(groupSubject, childKeys) {
+    const g = typeof groupSubject === 'string' ? groupSubject.trim() : '';
+    const normalizedChildKeys = Array.isArray(childKeys)
+      ? childKeys.filter((key) => typeof key === 'string' && key)
+      : [];
+
+    if (g && normalizedChildKeys.length) {
+      return `group:${g}|children:${normalizedChildKeys.slice().sort().join(',')}`;
+    }
+    if (g) return `group:${g}`;
+    if (normalizedChildKeys.length) return `children:${normalizedChildKeys.slice().sort().join(',')}`;
+    return null;
+  }
+
+  function buildGroupMarkerKeyFromData(group) {
+    const groupSubject = typeof group?.Subject === 'string' ? group.Subject : '';
+    const children = Array.isArray(group?.Children) ? group.Children : [];
+    const childKeys = children
+      .map((child) => buildChildMarkerKeyFromData(child, group))
+      .filter((key) => typeof key === 'string' && key);
+    return buildGroupMarkerKey(groupSubject, childKeys);
+  }
+
+  function buildGroupMarkerKeyFromDom(groupPanel) {
+    const groupSubject = getGroupSubjectFromPanel(groupPanel) || '';
+    const childKeys = getGroupChildPanels(groupPanel)
+      .map((childPanel) => buildChildMarkerKeyFromHeading(getChildHeading(childPanel), groupPanel))
+      .filter((key) => typeof key === 'string' && key);
+    return buildGroupMarkerKey(groupSubject, childKeys);
+  }
+
+  function findParentGroupPanelForChild(childPanel) {
+    if (!childPanel) return null;
+    const groups = getGroupPanels();
+    for (const groupPanel of groups) {
+      if (groupPanel.contains(childPanel)) return groupPanel;
+    }
+    return null;
   }
 
   function rebuildAlertDataIndex(payload) {
+    const nextIndex = alertsDataApi?.rebuildAlertDataIndex?.(payload, {
+      buildChildMarkerKeyFromData,
+      buildGroupMarkerKeyFromData
+    }) || {
+      childOldNoNoteById: new Map(),
+      childOldNoNoteByKey: new Map(),
+      childHasNoteById: new Map(),
+      childHasNoteByKey: new Map(),
+      groupHasOldNoNoteByKey: new Map(),
+      groupHasAnyNoteByKey: new Map(),
+      groupHasOldNoNoteBySubject: new Map(),
+      groupHasAnyNoteBySubject: new Map()
+    };
     childOldNoNoteById.clear();
-    childOldNoNoteBySubject.clear();
+    childOldNoNoteByKey.clear();
     childHasNoteById.clear();
-    childHasNoteBySubject.clear();
+    childHasNoteByKey.clear();
+    groupHasOldNoNoteByKey.clear();
+    groupHasAnyNoteByKey.clear();
     groupHasOldNoNoteBySubject.clear();
     groupHasAnyNoteBySubject.clear();
-
-    const groups = payload?.Groups?.NeedAck;
-    if (!Array.isArray(groups)) return;
-
-    for (const group of groups) {
-      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-      let groupHasOldNoNote = false;
-      let groupHasAnyNote = false;
-
-      const children = Array.isArray(group?.Children) ? group.Children : [];
-      for (const child of children) {
-        const childId = child?.State?.Id != null ? String(child.State.Id) : null;
-        const childSubject =
-          typeof child?.Subject === 'string' && child.Subject.trim()
-            ? child.Subject.trim()
-            : (typeof child?.AlertKey === 'string' ? child.AlertKey.trim() : null);
-
-        const oldEnough = isOlderThanThreshold(child?.Ago);
-        const hasNote = hasNoteFromActions(child?.State?.Actions);
-        const oldNoNote = oldEnough && !hasNote;
-
-        if (childId) {
-          childOldNoNoteById.set(childId, oldNoNote);
-          childHasNoteById.set(childId, hasNote);
-        }
-        if (childSubject) {
-          childOldNoNoteBySubject.set(childSubject, oldNoNote);
-          childHasNoteBySubject.set(childSubject, hasNote);
-        }
-
-        if (oldNoNote) groupHasOldNoNote = true;
-        if (hasNote) groupHasAnyNote = true;
-      }
-
-      if (groupSubject) {
-        const prevOld = groupHasOldNoNoteBySubject.get(groupSubject) === true;
-        const prevNote = groupHasAnyNoteBySubject.get(groupSubject) === true;
-
-        groupHasOldNoNoteBySubject.set(
-          groupSubject,
-          prevOld || groupHasOldNoNote
-        );
-        groupHasAnyNoteBySubject.set(groupSubject, prevNote || groupHasAnyNote);
-      }
-    }
+    for (const [key, value] of nextIndex.childOldNoNoteById) childOldNoNoteById.set(key, value);
+    for (const [key, value] of nextIndex.childOldNoNoteByKey) childOldNoNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.childHasNoteById) childHasNoteById.set(key, value);
+    for (const [key, value] of nextIndex.childHasNoteByKey) childHasNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.groupHasOldNoNoteByKey) groupHasOldNoNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.groupHasAnyNoteByKey) groupHasAnyNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.groupHasOldNoNoteBySubject) groupHasOldNoNoteBySubject.set(key, value);
+    for (const [key, value] of nextIndex.groupHasAnyNoteBySubject) groupHasAnyNoteBySubject.set(key, value);
   }
 
   function ensureStateIcon(title, type) {
@@ -1653,12 +1919,13 @@
     if (noteIcon) noteIcon.remove();
   }
 
-  function resolveChildState(panel) {
+  function resolveChildState(panel, parentGroupPanel = null) {
     const heading = getChildHeading(panel);
     if (!heading) return 'none';
 
     const panelId = getPanelIdFromHeading(heading);
-    const subject = getPanelSubjectFromHeading(heading);
+    const groupPanel = parentGroupPanel || findParentGroupPanelForChild(panel);
+    const childKey = buildChildMarkerKeyFromHeading(heading, groupPanel);
 
     let oldNoNote = false;
     let hasNote = false;
@@ -1668,9 +1935,9 @@
       if (childHasNoteById.has(panelId)) hasNote = childHasNoteById.get(panelId) === true;
     }
 
-    if (!oldNoNote && !hasNote && subject) {
-      if (childOldNoNoteBySubject.has(subject)) oldNoNote = childOldNoNoteBySubject.get(subject) === true;
-      if (childHasNoteBySubject.has(subject)) hasNote = childHasNoteBySubject.get(subject) === true;
+    if (!oldNoNote && !hasNote && childKey) {
+      if (childOldNoNoteByKey.has(childKey)) oldNoNote = childOldNoNoteByKey.get(childKey) === true;
+      if (childHasNoteByKey.has(childKey)) hasNote = childHasNoteByKey.get(childKey) === true;
     }
 
     if (oldNoNote) return 'warning';
@@ -1681,17 +1948,13 @@
   function resolveGroupStateFromDom(groupPanel) {
     if (!groupPanel) return 'none';
 
-    const childPanels = Array.from(
-      groupPanel.querySelectorAll('[ng-repeat="child in group.Children"]')
-    )
-      .map((node) => node.closest('.panel') || node)
-      .filter(Boolean);
+    const childPanels = getGroupChildPanels(groupPanel);
 
     let hasWarning = false;
     let hasNote = false;
 
     for (const childPanel of childPanels) {
-      const state = resolveChildState(childPanel);
+      const state = resolveChildState(childPanel, groupPanel);
       if (state === 'warning') hasWarning = true;
       else if (state === 'note') hasNote = true;
     }
@@ -1709,31 +1972,40 @@
   }
 
   function resolveGroupState(groupPanel) {
-    const subject = getGroupSubjectFromPanel(groupPanel);
+    const groupKey = buildGroupMarkerKeyFromDom(groupPanel);
+    const groupSubject = getGroupSubjectFromPanel(groupPanel);
 
     const domState = resolveGroupStateFromDom(groupPanel);
     if (domState !== 'none') {
-      if (subject) lastResolvedParentStateBySubject.set(subject, domState);
+      if (groupKey) lastResolvedParentStateByKey.set(groupKey, domState);
       return domState;
     }
 
-    if (subject) {
-      const hasOldNoNote = groupHasOldNoNoteBySubject.get(subject) === true;
-      const hasAnyNote = groupHasAnyNoteBySubject.get(subject) === true;
+    if (groupKey) {
+      const hasOldNoNote = groupHasOldNoNoteByKey.get(groupKey) === true;
+      const hasAnyNote = groupHasAnyNoteByKey.get(groupKey) === true;
 
       if (hasOldNoNote) {
-        lastResolvedParentStateBySubject.set(subject, 'warning');
+        lastResolvedParentStateByKey.set(groupKey, 'warning');
         return 'warning';
       }
       if (hasAnyNote) {
-        lastResolvedParentStateBySubject.set(subject, 'note');
+        lastResolvedParentStateByKey.set(groupKey, 'note');
         return 'note';
       }
 
-      const stickyState = lastResolvedParentStateBySubject.get(subject);
+      const stickyState = lastResolvedParentStateByKey.get(groupKey);
       if (stickyState === 'warning' || stickyState === 'note') {
         return stickyState;
       }
+    }
+
+    if (groupSubject) {
+      const hasOldNoNoteBySubject = groupHasOldNoNoteBySubject.get(groupSubject) === true;
+      const hasAnyNoteBySubject = groupHasAnyNoteBySubject.get(groupSubject) === true;
+
+      if (hasOldNoNoteBySubject) return 'warning';
+      if (hasAnyNoteBySubject) return 'note';
     }
 
     const existingState = getExistingParentMarkerState(groupPanel);
@@ -1770,49 +2042,6 @@
     applyNeedsAckMarkersFromData({ preserveExistingOnNone: true });
   }
 
-  async function fetchAlertsDataViaFetch() {
-    const resp = await fetch('/api/alerts?filter=', {
-      method: 'GET',
-      credentials: 'same-origin',
-      headers: { Accept: 'application/json' },
-      cache: 'no-store'
-    });
-
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-
-    return resp.json();
-  }
-
-  function fetchAlertsDataViaXHR() {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/alerts?filter=', true);
-      xhr.withCredentials = true;
-      xhr.setRequestHeader('Accept', 'application/json');
-
-      xhr.onload = function () {
-        if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(`HTTP ${xhr.status}`));
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch (err) {
-          reject(err);
-        }
-      };
-
-      xhr.onerror = function () {
-        reject(new Error('XMLHttpRequest network error'));
-      };
-
-      xhr.send();
-    });
-  }
-
   async function refreshAlertsData() {
     if (dataRefreshInFlight) {
       dataRefreshQueued = true;
@@ -1833,20 +2062,25 @@
 
     try {
       let payload;
+      if (!alertsDataApi?.fetchAlertsDataViaFetch || !alertsDataApi?.fetchAlertsDataViaXHR) {
+        throw new Error('alerts-data module unavailable');
+      }
       try {
-        payload = await fetchAlertsDataViaFetch();
+        payload = await alertsDataApi.fetchAlertsDataViaFetch();
       } catch (_) {
-        payload = await fetchAlertsDataViaXHR();
+        payload = await alertsDataApi.fetchAlertsDataViaXHR();
       }
 
       rebuildAlertDataIndex(payload);
-      processNeedAckNewAlertSounds(payload);
+      needAckBaselineApi?.process?.(payload);
       applyNeedsAckMarkersFromData();
       ensureCopyButtons();
       markNoSelectElements();
       refreshSilencedBadges();
+      reportDiagnostics('refresh-ok', 'alerts payload received');
     } catch (err) {
       console.warn('[Bosun plugin] Failed to refresh alerts data:', err);
+      reportDiagnostics('refresh-failed', err?.message || 'unknown-error');
     } finally {
       dataRefreshInFlight = false;
 
@@ -1871,6 +2105,20 @@
     if (observerStarted || !document.body) return;
     observerStarted = true;
 
+    function isNeedsAckNode(node, needsAckRoot) {
+      if (!node || node.nodeType !== 1) return false;
+
+      if (needsAckRoot && (node === needsAckRoot || needsAckRoot.contains(node))) {
+        return true;
+      }
+
+      if (node.matches?.('[ts-ack-group="schedule.Groups.NeedAck"]')) {
+        return true;
+      }
+
+      return !!node.querySelector?.('[ts-ack-group="schedule.Groups.NeedAck"]');
+    }
+
     const observer = new MutationObserver((mutations) => {
       let shouldRefreshUi = false;
       let shouldRefreshData = false;
@@ -1889,8 +2137,19 @@
 
         shouldRefreshUi = true;
 
-        if (needsAckRoot && (needsAckRoot.contains(target) || target === needsAckRoot)) {
+        if (isNeedsAckNode(target, needsAckRoot)) {
           shouldRefreshData = true;
+          continue;
+        }
+
+        if (mutation.type === 'childList') {
+          const addedNodes = mutation.addedNodes ? Array.from(mutation.addedNodes) : [];
+          const removedNodes = mutation.removedNodes ? Array.from(mutation.removedNodes) : [];
+          const changedNodes = [...addedNodes, ...removedNodes];
+
+          if (changedNodes.some((node) => isNeedsAckNode(node, needsAckRoot))) {
+            shouldRefreshData = true;
+          }
         }
       }
 
@@ -1912,9 +2171,12 @@
   }
 
   function init() {
+    restoreDiagnosticsLogFromStorage();
     injectStyles();
     installSelectionGuard();
     installUserActivityTracking();
+    soundApi?.installAudioUnlockTracking?.();
+    soundApi?.ensureAudioObjects?.();
     scheduleTopBarMount();
     restoreNeedAckSoundBaselineFromSession();
 
