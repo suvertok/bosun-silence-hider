@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Bosun Silence Hider",
-    "version": "1.4",
+    "version": "1.4.3",
     "description": "Браузерный плагин для дашборда Bosun, который снижает визуальный шум и ускоряет работу дежурного с алертами",
     "permissions": [
         "storage"
@@ -25,6 +25,12 @@
                 "*://bosun.edna.ru/*"
             ],
             "js": [
+                "shared-utils.js",
+                "diagnostics.js",
+                "sound.js",
+                "alerts-data.js",
+                "needack-baseline.js",
+                "needack-severity.js",
                 "content.js"
             ],
             "run_at": "document_end"

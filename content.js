@@ -59,19 +59,6 @@
   let topBarMountObserver = null;
   let soundAlertsEnabled = true;
   let diagnosticsEnabled = false;
-  let needAckSoundBaselineReady = false;
-  let previousNeedAckAlertIds = new Set();
-  let previousNeedAckSnapshotSize = 0;
-  let lastNeedAckChimeAt = 0;
-  let needAckRefreshAttempts = 0;
-  let needAckMissingCount = 0;
-  let audioUnlocked = false;
-  let pendingNeedAckChimeKind = null;
-  let pendingNeedAckRetryAttached = false;
-  let alertChimeAudio = null;
-  let softChimeAudio = null;
-  let diagnosticsModalOpen = false;
-  let diagnosticsLogEntries = [];
   const DIAGNOSTICS_LOG_MAX_ENTRIES = 750;
 
   // child maps
@@ -86,6 +73,37 @@
   const groupHasOldNoNoteBySubject = new Map();
   const groupHasAnyNoteBySubject = new Map();
   const lastResolvedParentStateByKey = new Map();
+  const sharedUtils = globalThis.BosunSilenceHiderSharedUtils || null;
+  const diagnosticsApi = globalThis.BosunSilenceHiderDiagnostics?.createDiagnostics?.({
+    modalId: DIAGNOSTICS_MODAL_ID,
+    logListId: DIAGNOSTICS_LOG_LIST_ID,
+    logStorageKey: DIAGNOSTICS_LOG_STORAGE_KEY,
+    maxEntries: DIAGNOSTICS_LOG_MAX_ENTRIES,
+    getEnabled: () => diagnosticsEnabled
+  }) || null;
+  const soundApi = globalThis.BosunSilenceHiderSound?.createSound?.({
+    alertFile: SOUND_FILE_ALERT,
+    softFile: SOUND_FILE_SOFT,
+    getEnabled: () => soundAlertsEnabled,
+    reportDiagnostics: (eventName, details = '') => reportDiagnostics(eventName, details)
+  }) || null;
+  const alertsDataApi = globalThis.BosunSilenceHiderAlertsData?.createAlertsData?.({
+    oldNoNoteMinutes: OLD_NO_NOTE_MINUTES
+  }) || null;
+  const needAckBaselineApi = globalThis.BosunSilenceHiderNeedAckBaseline?.createNeedAckBaseline?.({
+    sessionKey: NEED_ACK_SOUND_BASELINE_SESSION_KEY,
+    isSoundEnabled: () => soundAlertsEnabled,
+    reportDiagnostics: (eventName, details = '') => reportDiagnostics(eventName, details),
+    playNeedAckChime: (kind) => playNeedAckChime(kind),
+    collectCurrentIdsAndSeverity: (payload) => (
+      needAckSeverityApi
+        ? needAckSeverityApi.collectCurrentIdsAndSeverity(payload)
+        : { currentIds: new Set(), idToSeverity: new Map() }
+    )
+  }) || null;
+  const needAckSeverityApi = globalThis.BosunSilenceHiderNeedAckSeverity?.createNeedAckSeverity?.({
+    normalizeNeedAckChildren: (raw) => normalizeNeedAckChildren(raw)
+  }) || null;
 
   function isActionPage() {
     return window.location.pathname === '/action';
@@ -998,13 +1016,42 @@
   }
 
   function normalizeAutoRefreshIdleSeconds(value) {
+    if (sharedUtils?.normalizeAutoRefreshIdleSeconds) {
+      return sharedUtils.normalizeAutoRefreshIdleSeconds(value, {
+        min: AUTO_REFRESH_MIN_IDLE_SECONDS,
+        max: AUTO_REFRESH_MAX_IDLE_SECONDS,
+        fallback: AUTO_REFRESH_DEFAULT_IDLE_SECONDS
+      });
+    }
     const numericValue = Number(value);
     if (!Number.isFinite(numericValue)) return AUTO_REFRESH_DEFAULT_IDLE_SECONDS;
-
     return Math.min(
       AUTO_REFRESH_MAX_IDLE_SECONDS,
       Math.max(AUTO_REFRESH_MIN_IDLE_SECONDS, Math.round(numericValue))
     );
+  }
+
+  function normalizeNeedAckChildren(raw) {
+    if (sharedUtils?.normalizeNeedAckChildren) {
+      return sharedUtils.normalizeNeedAckChildren(raw);
+    }
+    if (raw == null) return [];
+    if (Array.isArray(raw)) return raw;
+    return [raw];
+  }
+
+  function uniqueNodes(nodes) {
+    if (sharedUtils?.uniqueNodes) {
+      return sharedUtils.uniqueNodes(nodes);
+    }
+    const seen = new Set();
+    const result = [];
+    for (const node of nodes) {
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      result.push(node);
+    }
+    return result;
   }
 
   function saveAutoRefreshState() {
@@ -1026,489 +1073,57 @@
   }
 
   function resetNeedAckSoundBaseline() {
-    needAckSoundBaselineReady = false;
-    previousNeedAckAlertIds = new Set();
-    previousNeedAckSnapshotSize = 0;
-    needAckRefreshAttempts = 0;
-    needAckMissingCount = 0;
-    clearNeedAckSoundBaselineSession();
-  }
-
-  function persistNeedAckSoundBaselineToSession() {
-    if (!window?.sessionStorage) return;
-    try {
-      const payload = {
-        ready: needAckSoundBaselineReady,
-        ids: Array.from(previousNeedAckAlertIds),
-        size: previousNeedAckSnapshotSize
-      };
-      window.sessionStorage.setItem(
-        NEED_ACK_SOUND_BASELINE_SESSION_KEY,
-        JSON.stringify(payload)
-      );
-    } catch (_) {}
+    needAckBaselineApi?.reset?.();
   }
 
   function restoreNeedAckSoundBaselineFromSession() {
-    if (!window?.sessionStorage) return;
-    try {
-      const raw = window.sessionStorage.getItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (!parsed || parsed.ready !== true || !Array.isArray(parsed.ids)) return;
-      previousNeedAckAlertIds = new Set(parsed.ids.filter((id) => typeof id === 'string' && id));
-      needAckSoundBaselineReady = true;
-      previousNeedAckSnapshotSize = Number.isFinite(Number(parsed.size))
-        ? Math.max(0, Math.round(Number(parsed.size)))
-        : previousNeedAckAlertIds.size;
-    } catch (_) {}
-  }
-
-  function clearNeedAckSoundBaselineSession() {
-    if (!window?.sessionStorage) return;
-    try {
-      window.sessionStorage.removeItem(NEED_ACK_SOUND_BASELINE_SESSION_KEY);
-    } catch (_) {}
-  }
-
-  function saveDiagnosticsLogToStorage() {
-    if (!window?.localStorage) return;
-    try {
-      const payload = JSON.stringify(diagnosticsLogEntries.slice(-DIAGNOSTICS_LOG_MAX_ENTRIES));
-      window.localStorage.setItem(DIAGNOSTICS_LOG_STORAGE_KEY, payload);
-    } catch (_) {}
+    needAckBaselineApi?.restoreFromSession?.();
   }
 
   function restoreDiagnosticsLogFromStorage() {
-    if (!window?.localStorage) return;
-    try {
-      const raw = window.localStorage.getItem(DIAGNOSTICS_LOG_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return;
-      diagnosticsLogEntries = parsed
-        .filter((entry) => entry && typeof entry === 'object')
-        .map((entry) => ({
-          time: String(entry.time || ''),
-          event: String(entry.event || 'unknown'),
-          details: String(entry.details || '')
-        }))
-        .slice(-DIAGNOSTICS_LOG_MAX_ENTRIES);
-    } catch (_) {}
-  }
-
-  function formatDiagnosticsTimestamp(date) {
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mm = String(date.getMinutes()).padStart(2, '0');
-    const ss = String(date.getSeconds()).padStart(2, '0');
-    return `${hh}:${mm}:${ss}`;
-  }
-
-  function renderDiagnosticsLogList() {
-    const list = document.getElementById(DIAGNOSTICS_LOG_LIST_ID);
-    if (!list) return;
-    if (!diagnosticsLogEntries.length) {
-      list.innerHTML = '<li>Лог пуст. Включи "Диагностика" и дождись событий.</li>';
-      return;
-    }
-
-    list.innerHTML = diagnosticsLogEntries
-      .map((entry) => {
-        const details = entry.details ? ` | ${entry.details}` : '';
-        return `<li>[${entry.time}] ${entry.event}${details}</li>`;
-      })
-      .join('');
-    list.scrollTop = list.scrollHeight;
+    diagnosticsApi?.restoreLogFromStorage?.();
   }
 
   function setDiagnosticsModalOpen(isOpen) {
-    const modal = document.getElementById(DIAGNOSTICS_MODAL_ID);
-    if (!modal) return;
-    diagnosticsModalOpen = isOpen;
-    modal.classList.toggle('is-open', isOpen);
-    if (isOpen) renderDiagnosticsLogList();
-  }
-
-  function appendDiagnosticsLog(eventName, details = '') {
-    diagnosticsLogEntries.push({
-      time: formatDiagnosticsTimestamp(new Date()),
-      event: String(eventName || 'unknown'),
-      details: String(details || '')
-    });
-    if (diagnosticsLogEntries.length > DIAGNOSTICS_LOG_MAX_ENTRIES) {
-      diagnosticsLogEntries = diagnosticsLogEntries.slice(-DIAGNOSTICS_LOG_MAX_ENTRIES);
-    }
-    saveDiagnosticsLogToStorage();
-    if (diagnosticsModalOpen) renderDiagnosticsLogList();
+    diagnosticsApi?.setModalOpen?.(isOpen);
   }
 
   function reportDiagnostics(eventName, details = '') {
-    if (!diagnosticsEnabled) return;
-    appendDiagnosticsLog(eventName, details);
-    console.debug('[Bosun plugin][diag]', eventName, details);
-  }
-
-  function normalizeNeedAckChildren(raw) {
-    if (raw == null) return [];
-    if (Array.isArray(raw)) return raw;
-    return [raw];
+    diagnosticsApi?.report?.(eventName, details);
   }
 
   function parseNeedAckStatusToBucket(raw) {
-    const s = String(raw ?? '').toLowerCase().trim();
-    if (s === 'critical') return 'critical';
-    if (s === 'warning') return 'warning';
-    if (s === 'unknown') return 'unknown';
-    if (s === 'normal' || s === 'none' || !s) return 'unknown';
-    if (s.includes('crit')) return 'critical';
-    if (s.includes('warn')) return 'warning';
-    return 'unknown';
+    return needAckSeverityApi?.parseNeedAckStatusToBucket?.(raw) ?? 'unknown';
   }
 
   /** В шаблоне Bosun у группы есть CurrentStatus; у ребёнка — State.* и Events[].Status */
   function getNeedAckSeverityBucket(child, group) {
-    const state = child?.State || {};
-    const events = Array.isArray(state.Events) ? state.Events : [];
-    const lastEv = events.length ? events[events.length - 1] : null;
-    const fromChild =
-      state.CurrentStatus ??
-      state.WorstStatus ??
-      state.LastAbnormalStatus ??
-      lastEv?.Status ??
-      '';
-    let bucket = parseNeedAckStatusToBucket(fromChild);
-    if (bucket === 'unknown' && !String(fromChild).trim() && group) {
-      const fromGroup =
-        group.CurrentStatus ??
-        group.WorstStatus ??
-        group.Status ??
-        '';
-      bucket = parseNeedAckStatusToBucket(fromGroup);
-    }
-    return bucket;
+    return needAckSeverityApi?.getNeedAckSeverityBucket?.(child, group) ?? 'unknown';
   }
 
   function getNeedAckSeverityFromGroupOnly(group) {
-    const raw =
-      group?.CurrentStatus ??
-      group?.WorstStatus ??
-      group?.Status ??
-      '';
-    return parseNeedAckStatusToBucket(raw);
+    return needAckSeverityApi?.getNeedAckSeverityFromGroupOnly?.(group) ?? 'unknown';
   }
 
   /** Стабильный ключ: Id -> AlertKey+Tags -> group+child+ago -> fallback */
   function needAckStableKey(child, group) {
-    const state = child?.State || {};
-    const id = state?.Id;
-    if (id != null && String(id).trim() !== '') {
-      return `id:${String(id).trim()}`;
-    }
-
-    const alertKey =
-      (typeof child?.AlertKey === 'string' && child.AlertKey.trim()) ||
-      (typeof state?.Alert === 'string' && state.Alert.trim()) ||
-      '';
-    const tags =
-      typeof state?.Tags === 'string' && state.Tags.trim()
-        ? state.Tags.trim()
-        : '';
-
-    if (alertKey && tags) {
-      return `ak:${alertKey}|tags:${tags}`;
-    }
-
-    if (alertKey) {
-      return `ak:${alertKey}`;
-    }
-
-    const groupSub =
-      typeof group?.Subject === 'string' && group.Subject.trim()
-        ? group.Subject.trim()
-        : '';
-    const childSub =
-      typeof child?.Subject === 'string' && child.Subject.trim()
-        ? child.Subject.trim()
-        : '';
-    const ago =
-      typeof child?.Ago === 'string' && child.Ago.trim()
-        ? child.Ago.trim()
-        : '';
-
-    if (groupSub && childSub && ago) {
-      return `g:${groupSub}|c:${childSub}|ago:${ago}`;
-    }
-
-    if (groupSub && childSub) {
-      return `g:${groupSub}|c:${childSub}`;
-    }
-
-    if (childSub) {
-      return `c:${childSub}`;
-    }
-
-    if (groupSub) {
-      return `g:${groupSub}`;
-    }
-
-    return null;
+    return needAckSeverityApi?.needAckStableKey?.(child, group) ?? null;
   }
 
   function ensureAudioObjects() {
-    if (!chrome?.runtime?.getURL) return;
-
-    if (!alertChimeAudio) {
-      alertChimeAudio = new Audio(chrome.runtime.getURL(SOUND_FILE_ALERT));
-      alertChimeAudio.preload = 'auto';
-      alertChimeAudio.volume = 0.85;
-    }
-
-    if (!softChimeAudio) {
-      softChimeAudio = new Audio(chrome.runtime.getURL(SOUND_FILE_SOFT));
-      softChimeAudio.preload = 'auto';
-      softChimeAudio.volume = 0.85;
-    }
-  }
-
-  function unlockAudioOnce() {
-    if (audioUnlocked) return;
-
-    ensureAudioObjects();
-
-    const candidates = [alertChimeAudio, softChimeAudio].filter(Boolean);
-    if (!candidates.length) return;
-
-    const unlockPromises = candidates.map((audio) => {
-      try {
-        audio.muted = true;
-        audio.currentTime = 0;
-        const playPromise = audio.play();
-        if (playPromise && typeof playPromise.then === 'function') {
-          return playPromise
-            .then(() => {
-              audio.pause();
-              audio.currentTime = 0;
-              audio.muted = false;
-            })
-            .catch(() => {});
-        }
-      } catch (_) {}
-      return Promise.resolve();
-    });
-
-    Promise.allSettled(unlockPromises).finally(() => {
-      audioUnlocked = true;
-    });
+    soundApi?.ensureAudioObjects?.();
   }
 
   function installAudioUnlockTracking() {
-    const onceHandler = () => {
-      unlockAudioOnce();
-      window.removeEventListener('pointerdown', onceHandler, true);
-      window.removeEventListener('keydown', onceHandler, true);
-    };
-
-    window.addEventListener('pointerdown', onceHandler, true);
-    window.addEventListener('keydown', onceHandler, true);
-  }
-
-  function formatPlayError(err) {
-    if (!err) return 'unknown';
-    const name = typeof err?.name === 'string' ? err.name : '';
-    const message = typeof err?.message === 'string' ? err.message : '';
-    if (name && message) return `${name}: ${message}`;
-    return name || message || String(err);
-  }
-
-  function isAutoplayBlockReason(reason) {
-    if (!reason) return false;
-    return /NotAllowedError|gesture|interact/i.test(String(reason));
-  }
-
-  function scheduleNeedAckChimeRetry(kind, reason) {
-    if (!isAutoplayBlockReason(reason)) return;
-
-    // If both kinds are pending, keep the more important alert chime.
-    if (pendingNeedAckChimeKind !== 'alert') {
-      pendingNeedAckChimeKind = kind;
-    }
-
-    if (pendingNeedAckRetryAttached) return;
-    pendingNeedAckRetryAttached = true;
-
-    const retryHandler = () => {
-      window.removeEventListener('pointerdown', retryHandler, true);
-      window.removeEventListener('keydown', retryHandler, true);
-      pendingNeedAckRetryAttached = false;
-
-      const retryKind = pendingNeedAckChimeKind;
-      pendingNeedAckChimeKind = null;
-      if (!retryKind || !soundAlertsEnabled) return;
-
-      unlockAudioOnce();
-      setTimeout(() => {
-        playNeedAckChime(retryKind);
-      }, 0);
-    };
-
-    window.addEventListener('pointerdown', retryHandler, true);
-    window.addEventListener('keydown', retryHandler, true);
-    reportDiagnostics('sound-retry-armed', `kind=${kind}`);
+    soundApi?.installAudioUnlockTracking?.();
   }
 
   function playNeedAckChime(kind) {
-    if (!soundAlertsEnabled) return;
-
-    const now = Date.now();
-    if (now - lastNeedAckChimeAt < 450) {
-      reportDiagnostics('sound-throttled', `kind=${kind}`);
-      return;
-    }
-    lastNeedAckChimeAt = now;
-
-    ensureAudioObjects();
-
-    const file = kind === 'alert' ? SOUND_FILE_ALERT : SOUND_FILE_SOFT;
-    const audio = kind === 'alert' ? alertChimeAudio : softChimeAudio;
-    if (!audio) return;
-
-    try {
-      audio.pause();
-      audio.currentTime = 0;
-
-      const playPromise = audio.play();
-      if (playPromise && typeof playPromise.then === 'function') {
-        playPromise
-          .then(() => {
-            reportDiagnostics('sound-played', `kind=${kind}, file=${file}`);
-          })
-          .catch((err) => {
-            const reason = err?.name || err?.message || 'play-error';
-            console.warn('[Bosun plugin] Sound play blocked or failed:', formatPlayError(err), err);
-            // Let retry bypass anti-spam throttle when initial attempt was blocked by autoplay.
-            lastNeedAckChimeAt = 0;
-            scheduleNeedAckChimeRetry(kind, reason);
-            reportDiagnostics('sound-blocked', `kind=${kind}, reason=${reason}`);
-          });
-      }
-    } catch (err) {
-      console.warn('[Bosun plugin] Sound play failed:', formatPlayError(err), err);
-      const reason = err?.name || err?.message || 'play-error';
-      lastNeedAckChimeAt = 0;
-      scheduleNeedAckChimeRetry(kind, reason);
-      reportDiagnostics('sound-blocked', `kind=${kind}, reason=${reason}`);
-    }
+    soundApi?.playNeedAckChime?.(kind);
   }
 
   function processNeedAckNewAlertSounds(payload) {
-    needAckRefreshAttempts += 1;
-
-    if (!soundAlertsEnabled) {
-      reportDiagnostics('sound-disabled', 'toggle=off');
-      return;
-    }
-
-    const groups = payload?.Groups?.NeedAck;
-    if (!Array.isArray(groups)) {
-      needAckMissingCount += 1;
-      reportDiagnostics('needack-missing', 'Groups.NeedAck is not array');
-      return;
-    }
-
-    const currentIds = new Set();
-    const idToSeverity = new Map();
-
-    for (const group of groups) {
-      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-      const children = normalizeNeedAckChildren(group?.Children);
-
-      if (!children.length && groupSubject) {
-        const key = `grp:${groupSubject}`;
-        currentIds.add(key);
-        idToSeverity.set(key, getNeedAckSeverityFromGroupOnly(group));
-        continue;
-      }
-
-      let anyChildKey = false;
-      for (const child of children) {
-        const key = needAckStableKey(child, group);
-        if (!key) continue;
-        anyChildKey = true;
-        currentIds.add(key);
-        idToSeverity.set(key, getNeedAckSeverityBucket(child, group));
-      }
-      if (!anyChildKey && groupSubject) {
-        const key = `grp:${groupSubject}`;
-        currentIds.add(key);
-        idToSeverity.set(key, getNeedAckSeverityFromGroupOnly(group));
-      }
-    }
-
-    if (!needAckSoundBaselineReady) {
-      // If endpoint shape was missing on previous refreshes and first valid snapshot
-      // already contains alerts, play one chime so we don't silently miss them.
-      if (needAckMissingCount > 0 && needAckRefreshAttempts > 1 && currentIds.size > 0) {
-        let hasAlertChime = false;
-        let hasSoft = false;
-        for (const id of currentIds) {
-          const bucket = idToSeverity.get(id) || 'unknown';
-          if (bucket === 'critical' || bucket === 'unknown') hasAlertChime = true;
-          else hasSoft = true;
-        }
-        if (hasAlertChime) playNeedAckChime('alert');
-        else if (hasSoft) playNeedAckChime('soft');
-        reportDiagnostics('baseline-init-with-chime', `ids=${currentIds.size}, missingBefore=${needAckMissingCount}`);
-      }
-
-      previousNeedAckAlertIds = currentIds;
-      previousNeedAckSnapshotSize = currentIds.size;
-      needAckSoundBaselineReady = true;
-      needAckMissingCount = 0;
-      persistNeedAckSoundBaselineToSession();
-      reportDiagnostics('baseline-init', `ids=${currentIds.size}`);
-      return;
-    }
-
-    const currentSize = currentIds.size;
-    if (
-      previousNeedAckSnapshotSize > 0 &&
-      currentSize > 0 &&
-      Math.abs(currentSize - previousNeedAckSnapshotSize) >
-        Math.max(5, previousNeedAckSnapshotSize * 0.7)
-    ) {
-      const prevSize = previousNeedAckSnapshotSize;
-      previousNeedAckAlertIds = currentIds;
-      previousNeedAckSnapshotSize = currentSize;
-      persistNeedAckSoundBaselineToSession();
-      reportDiagnostics('baseline-reset', `prev=${prevSize}, current=${currentSize}`);
-      return;
-    }
-
-    const newIds = [];
-    for (const id of currentIds) {
-      if (!previousNeedAckAlertIds.has(id)) newIds.push(id);
-    }
-    previousNeedAckAlertIds = currentIds;
-    previousNeedAckSnapshotSize = currentSize;
-    persistNeedAckSoundBaselineToSession();
-
-    if (!newIds.length) {
-      reportDiagnostics('no-new-alerts', `ids=${currentIds.size}`);
-      return;
-    }
-
-    let hasAlertChime = false;
-    let hasSoft = false;
-    for (const id of newIds) {
-      const bucket = idToSeverity.get(id) || 'unknown';
-      if (bucket === 'critical' || bucket === 'unknown') hasAlertChime = true;
-      else if (bucket === 'warning') hasSoft = true;
-      else hasSoft = true;
-    }
-
-    if (hasAlertChime) playNeedAckChime('alert');
-    else if (hasSoft) playNeedAckChime('soft');
-    reportDiagnostics('new-alerts', `new=${newIds.length}, total=${currentIds.size}`);
+    needAckBaselineApi?.process?.(payload);
   }
 
   function loadState(callback) {
@@ -1685,7 +1300,8 @@
     if (cb) cb.checked = diagnosticsEnabled;
     const openBtn = document.getElementById(DIAGNOSTICS_OPEN_BUTTON_ID);
     if (openBtn) {
-      openBtn.textContent = diagnosticsModalOpen ? 'Закрыть лог' : 'Открыть лог';
+      const isOpen = diagnosticsApi?.isModalOpen?.() === true;
+      openBtn.textContent = isOpen ? 'Закрыть лог' : 'Открыть лог';
     }
   }
 
@@ -1714,48 +1330,13 @@
   function handleDiagnosticsOpenClick(e) {
     e.preventDefault();
     e.stopPropagation();
-    setDiagnosticsModalOpen(!diagnosticsModalOpen);
+    const isOpen = diagnosticsApi?.isModalOpen?.() === true;
+    setDiagnosticsModalOpen(!isOpen);
     updateDiagnosticsControl();
   }
 
   function ensureDiagnosticsModal() {
-    let modal = document.getElementById(DIAGNOSTICS_MODAL_ID);
-    if (modal) return modal;
-
-    modal = document.createElement('div');
-    modal.id = DIAGNOSTICS_MODAL_ID;
-    modal.innerHTML = `
-      <div class="bosun-diagnostics-modal-card" role="dialog" aria-modal="true" aria-label="Diagnostics log">
-        <div class="bosun-diagnostics-modal-head">
-          <strong>Bosun Diagnostics Log</strong>
-          <div class="bosun-diagnostics-modal-actions">
-            <button type="button" data-role="clear">Очистить</button>
-            <button type="button" data-role="close">Закрыть</button>
-          </div>
-        </div>
-        <div class="bosun-diagnostics-modal-body">
-          <ul id="${DIAGNOSTICS_LOG_LIST_ID}"></ul>
-        </div>
-      </div>
-    `;
-
-    modal.addEventListener('click', (event) => {
-      const role = event.target?.getAttribute?.('data-role');
-      if (event.target === modal || role === 'close') {
-        setDiagnosticsModalOpen(false);
-        updateDiagnosticsControl();
-        return;
-      }
-      if (role === 'clear') {
-        diagnosticsLogEntries = [];
-        saveDiagnosticsLogToStorage();
-        renderDiagnosticsLogList();
-      }
-    });
-
-    document.body.appendChild(modal);
-    renderDiagnosticsLogList();
-    return modal;
+    return diagnosticsApi?.ensureModal?.(updateDiagnosticsControl) || null;
   }
 
   function ensureSoundAlertsControls(actions) {
@@ -2022,19 +1603,6 @@
     return document.querySelector('[ts-ack-group="schedule.Groups.NeedAck"]');
   }
 
-  function uniqueNodes(nodes) {
-    const seen = new Set();
-    const result = [];
-
-    for (const node of nodes) {
-      if (!node || seen.has(node)) continue;
-      seen.add(node);
-      result.push(node);
-    }
-
-    return result;
-  }
-
   function getGroupPanels() {
     const root = getNeedsAckRoot();
     if (!root) return [];
@@ -2183,26 +1751,20 @@
     return null;
   }
 
-  function hasNoteFromActions(actions) {
-    if (!Array.isArray(actions)) return false;
-
-    return actions.some((action) => {
-      return action &&
-        action.Type === 'Note' &&
-        typeof action.Message === 'string' &&
-        action.Message.trim().length > 0 &&
-        action.Cancelled !== true;
-    });
-  }
-
-  function isOlderThanThreshold(agoValue) {
-    if (!agoValue) return false;
-    const ts = Date.parse(agoValue);
-    if (!Number.isFinite(ts)) return false;
-    return (Date.now() - ts) >= OLD_NO_NOTE_MINUTES * 60 * 1000;
-  }
-
   function rebuildAlertDataIndex(payload) {
+    const nextIndex = alertsDataApi?.rebuildAlertDataIndex?.(payload, {
+      buildChildMarkerKeyFromData,
+      buildGroupMarkerKeyFromData
+    }) || {
+      childOldNoNoteById: new Map(),
+      childOldNoNoteByKey: new Map(),
+      childHasNoteById: new Map(),
+      childHasNoteByKey: new Map(),
+      groupHasOldNoNoteByKey: new Map(),
+      groupHasAnyNoteByKey: new Map(),
+      groupHasOldNoNoteBySubject: new Map(),
+      groupHasAnyNoteBySubject: new Map()
+    };
     childOldNoNoteById.clear();
     childOldNoNoteByKey.clear();
     childHasNoteById.clear();
@@ -2211,56 +1773,14 @@
     groupHasAnyNoteByKey.clear();
     groupHasOldNoNoteBySubject.clear();
     groupHasAnyNoteBySubject.clear();
-
-    const groups = payload?.Groups?.NeedAck;
-    if (!Array.isArray(groups)) return;
-
-    for (const group of groups) {
-      let groupHasOldNoNote = false;
-      let groupHasAnyNote = false;
-
-      const children = Array.isArray(group?.Children) ? group.Children : [];
-      for (const child of children) {
-        const childId = child?.State?.Id != null ? String(child.State.Id) : null;
-        const childKey = buildChildMarkerKeyFromData(child, group);
-
-        const oldEnough = isOlderThanThreshold(child?.Ago);
-        const hasNote = hasNoteFromActions(child?.State?.Actions);
-        const oldNoNote = oldEnough && !hasNote;
-
-        if (childId) {
-          childOldNoNoteById.set(childId, oldNoNote);
-          childHasNoteById.set(childId, hasNote);
-        }
-        if (childKey) {
-          childOldNoNoteByKey.set(childKey, oldNoNote);
-          childHasNoteByKey.set(childKey, hasNote);
-        }
-
-        if (oldNoNote) groupHasOldNoNote = true;
-        if (hasNote) groupHasAnyNote = true;
-      }
-
-      const groupKey = buildGroupMarkerKeyFromData(group);
-      if (groupKey) {
-        const prevOld = groupHasOldNoNoteByKey.get(groupKey) === true;
-        const prevNote = groupHasAnyNoteByKey.get(groupKey) === true;
-
-        groupHasOldNoNoteByKey.set(
-          groupKey,
-          prevOld || groupHasOldNoNote
-        );
-        groupHasAnyNoteByKey.set(groupKey, prevNote || groupHasAnyNote);
-      }
-
-      const groupSubject = typeof group?.Subject === 'string' ? group.Subject.trim() : '';
-      if (groupSubject) {
-        const prevOldBySubject = groupHasOldNoNoteBySubject.get(groupSubject) === true;
-        const prevNoteBySubject = groupHasAnyNoteBySubject.get(groupSubject) === true;
-        groupHasOldNoNoteBySubject.set(groupSubject, prevOldBySubject || groupHasOldNoNote);
-        groupHasAnyNoteBySubject.set(groupSubject, prevNoteBySubject || groupHasAnyNote);
-      }
-    }
+    for (const [key, value] of nextIndex.childOldNoNoteById) childOldNoNoteById.set(key, value);
+    for (const [key, value] of nextIndex.childOldNoNoteByKey) childOldNoNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.childHasNoteById) childHasNoteById.set(key, value);
+    for (const [key, value] of nextIndex.childHasNoteByKey) childHasNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.groupHasOldNoNoteByKey) groupHasOldNoNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.groupHasAnyNoteByKey) groupHasAnyNoteByKey.set(key, value);
+    for (const [key, value] of nextIndex.groupHasOldNoNoteBySubject) groupHasOldNoNoteBySubject.set(key, value);
+    for (const [key, value] of nextIndex.groupHasAnyNoteBySubject) groupHasAnyNoteBySubject.set(key, value);
   }
 
   function ensureStateIcon(title, type) {
@@ -2480,46 +2000,17 @@
   }
 
   async function fetchAlertsDataViaFetch() {
-    const resp = await fetch('/api/alerts?filter=', {
-      method: 'GET',
-      credentials: 'same-origin',
-      headers: { Accept: 'application/json' },
-      cache: 'no-store'
-    });
-
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
+    if (!alertsDataApi?.fetchAlertsDataViaFetch) {
+      throw new Error('alerts-data module unavailable');
     }
-
-    return resp.json();
+    return alertsDataApi.fetchAlertsDataViaFetch();
   }
 
   function fetchAlertsDataViaXHR() {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/alerts?filter=', true);
-      xhr.withCredentials = true;
-      xhr.setRequestHeader('Accept', 'application/json');
-
-      xhr.onload = function () {
-        if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(`HTTP ${xhr.status}`));
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch (err) {
-          reject(err);
-        }
-      };
-
-      xhr.onerror = function () {
-        reject(new Error('XMLHttpRequest network error'));
-      };
-
-      xhr.send();
-    });
+    if (!alertsDataApi?.fetchAlertsDataViaXHR) {
+      return Promise.reject(new Error('alerts-data module unavailable'));
+    }
+    return alertsDataApi.fetchAlertsDataViaXHR();
   }
 
   async function refreshAlertsData() {
